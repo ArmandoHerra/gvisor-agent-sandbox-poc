@@ -85,6 +85,7 @@ start-proxy: build-proxy ## Start the proxy container (bridge + internal network
 			-e ANTHROPIC_API_KEY="$(ANTHROPIC_API_KEY)" \
 			-e PROXY_HOST=0.0.0.0 \
 			-e PROXY_PORT=$(PROXY_PORT) \
+			$(if $(PROXY_ALLOWED_EXTERNAL_HOSTS),-e PROXY_ALLOWED_EXTERNAL_HOSTS="$(PROXY_ALLOWED_EXTERNAL_HOSTS)") \
 			$(PROXY_IMAGE); \
 		docker network connect $(PROXY_NET) $(PROXY_NAME); \
 		sleep 1; \

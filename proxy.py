@@ -118,35 +118,66 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
     upstream_session: aiohttp.ClientSession = request.app["upstream_session"]
     request_start = time.monotonic()
 
-    # --- 1. Path allowlist ---
+    # --- 0. External host routing ---
+    target_host = request.headers.get("X-Target-Host", "").strip().lower()
+    is_external = bool(target_host)
+
+    if is_external:
+        if target_host not in config.allowed_external_hosts:
+            elapsed_ms = (time.monotonic() - request_start) * 1000
+            logger.warning(
+                "Blocked request to disallowed external host",
+                extra={
+                    "extra_data": {
+                        "method": request.method,
+                        "host": target_host,
+                        "path": request.path,
+                        "status": 403,
+                        "latency_ms": round(elapsed_ms, 2),
+                        "reason": "host_not_allowed",
+                    }
+                },
+            )
+            return web.json_response(
+                {
+                    "error": {
+                        "type": "forbidden",
+                        "message": f"Host '{target_host}' is not in the allowed external hosts list.",
+                    }
+                },
+                status=403,
+            )
+
+    # --- 1. Path allowlist (Anthropic API only — external hosts skip this) ---
     request_path = request.path
-    path_allowed = any(
-        request_path == allowed or request_path.startswith(allowed + "/")
-        for allowed in config.allowed_paths
-    )
-    if not path_allowed:
-        elapsed_ms = (time.monotonic() - request_start) * 1000
-        logger.warning(
-            "Blocked request to disallowed path",
-            extra={
-                "extra_data": {
-                    "method": request.method,
-                    "path": request_path,
-                    "status": 403,
-                    "latency_ms": round(elapsed_ms, 2),
-                    "reason": "path_not_allowed",
-                }
-            },
+    if not is_external:
+        path_allowed = any(
+            request_path == allowed or request_path.startswith(allowed + "/")
+            for allowed in config.allowed_paths
         )
-        return web.json_response(
-            {
-                "error": {
-                    "type": "forbidden",
-                    "message": f"Path '{request_path}' is not in the allowed list.",
-                }
-            },
-            status=403,
-        )
+        if not path_allowed:
+            elapsed_ms = (time.monotonic() - request_start) * 1000
+            logger.warning(
+                "Blocked request to disallowed path",
+                extra={
+                    "extra_data": {
+                        "method": request.method,
+                        "path": request_path,
+                        "status": 403,
+                        "latency_ms": round(elapsed_ms, 2),
+                        "reason": "path_not_allowed",
+                    }
+                },
+            )
+            return web.json_response(
+                {
+                    "error": {
+                        "type": "forbidden",
+                        "message": f"Path '{request_path}' is not in the allowed list.",
+                    }
+                },
+                status=403,
+            )
 
     # --- 2. Rate limiting ---
     if not await rate_limiter.acquire():
@@ -210,22 +241,31 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
             )
 
     # --- 4. Build upstream request ---
-    upstream_url = f"{config.upstream_base_url}{request_path}"
+    if is_external:
+        upstream_url = f"https://{target_host}{request_path}"
+    else:
+        upstream_url = f"{config.upstream_base_url}{request_path}"
     if request.query_string:
         upstream_url += f"?{request.query_string}"
 
-    # Copy headers, inject real API key, strip hop-by-hop headers
+    # Copy headers, strip hop-by-hop and proxy-specific headers
     upstream_headers = {}
     hop_by_hop = {"host", "connection", "transfer-encoding", "keep-alive", "upgrade", "accept-encoding"}
+    proxy_headers = {"x-target-host"}
+    strip_headers = hop_by_hop | proxy_headers
     for key, value in request.headers.items():
-        if key.lower() not in hop_by_hop:
+        if key.lower() not in strip_headers:
             upstream_headers[key] = value
 
-    # Inject the real API key (overwrite whatever the container sent)
-    upstream_headers["x-api-key"] = config.anthropic_api_key
-    upstream_headers["anthropic-version"] = upstream_headers.get(
-        "anthropic-version", "2023-06-01"
-    )
+    if is_external:
+        # External host: no API key injection; Host header is derived from URL by aiohttp
+        pass
+    else:
+        # Anthropic API: inject the real API key
+        upstream_headers["x-api-key"] = config.anthropic_api_key
+        upstream_headers["anthropic-version"] = upstream_headers.get(
+            "anthropic-version", "2023-06-01"
+        )
 
     # --- 5. Forward to upstream ---
     try:
@@ -273,18 +313,19 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
                 )
 
             elapsed_ms = (time.monotonic() - request_start) * 1000
+            log_data = {
+                "method": request.method,
+                "path": request_path,
+                "upstream_status": upstream_resp.status,
+                "latency_ms": round(elapsed_ms, 2),
+                "request_bytes": len(body),
+                "streaming": is_streaming,
+            }
+            if is_external:
+                log_data["external_host"] = target_host
             logger.info(
                 "Proxied request",
-                extra={
-                    "extra_data": {
-                        "method": request.method,
-                        "path": request_path,
-                        "upstream_status": upstream_resp.status,
-                        "latency_ms": round(elapsed_ms, 2),
-                        "request_bytes": len(body),
-                        "streaming": is_streaming,
-                    }
-                },
+                extra={"extra_data": log_data},
             )
             return response
 

@@ -23,6 +23,7 @@ class ProxyConfig:
         "/v1/complete",
         "/v1/messages/batches",
     ])
+    allowed_external_hosts: list[str] = field(default_factory=list)
     max_request_body_bytes: int = 1_048_576  # 1 MiB
     rate_limit_requests_per_minute: int = 60
     rate_limit_burst: int = 10
@@ -79,6 +80,12 @@ class ProxyConfig:
         allowed = os.environ.get("PROXY_ALLOWED_PATHS")
         if allowed:
             config.allowed_paths = [p.strip() for p in allowed.split(",") if p.strip()]
+
+        external_hosts = os.environ.get("PROXY_ALLOWED_EXTERNAL_HOSTS")
+        if external_hosts:
+            config.allowed_external_hosts = [
+                h.strip().lower() for h in external_hosts.split(",") if h.strip()
+            ]
 
         return config
 

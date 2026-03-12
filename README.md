@@ -90,6 +90,7 @@ make prompt-proxied        # network-isolated mode
 | `PROXY_LOG_LEVEL` | No | `INFO` | Proxy log level |
 | `PROXY_LOG_FORMAT` | No | `json` | Log format (`json` or `text`) |
 | `PROXY_ALLOWED_PATHS` | No | `/v1/messages,/v1/complete,/v1/messages/batches` | Comma-separated API path allowlist |
+| `PROXY_ALLOWED_EXTERNAL_HOSTS` | No | _(empty)_ | Comma-separated external hosts the agent can reach via proxy (e.g., `github.com,google.com`) |
 
 ### Makefile Variables
 
@@ -129,12 +130,43 @@ The agent container connects directly to `https://api.anthropic.com` with the re
 4. The proxy validates the path, enforces rate limits and body size, injects the real API key, and forwards to `https://api.anthropic.com`
 5. Responses (including streaming) are relayed back to the agent
 
+### External Host Routing
+
+The proxy can optionally forward requests to whitelisted external hosts, allowing the sandboxed agent to reach trusted services (e.g., GitHub, Google) without direct internet access.
+
+```bash
+# In .env, add the hosts you want to allow:
+PROXY_ALLOWED_EXTERNAL_HOSTS=github.com,google.com,api.example.com
+
+# Then run as usual — the proxy picks up the setting from .env
+make run-proxied
+```
+
+The agent sends requests to the proxy with an `X-Target-Host` header:
+
+```python
+import httpx
+
+# Route through the proxy to an external host
+resp = httpx.get(
+    "http://proxy-host:18080/api/repos",
+    headers={"X-Target-Host": "github.com"},
+)
+```
+
+- Only hosts listed in `PROXY_ALLOWED_EXTERNAL_HOSTS` are permitted (403 otherwise)
+- External requests skip the Anthropic path allowlist (any path is valid)
+- Rate limiting and body size limits still apply
+- No API key injection — the `X-Target-Host` header is stripped before forwarding; `Host` is derived from the URL by aiohttp
+- All external requests are logged with the target host for audit
+
 ### Proxy Security Controls
 
-- **Path allowlist** — Only `/v1/messages`, `/v1/complete`, `/v1/messages/batches` are forwarded
+- **Path allowlist** — Only `/v1/messages`, `/v1/complete`, `/v1/messages/batches` are forwarded (Anthropic API only)
+- **External host whitelist** — Optional list of trusted external hosts the agent can reach via `X-Target-Host` header
 - **Rate limiting** — Token bucket algorithm (default: 60 RPM, burst 10)
 - **Body size limit** — Rejects requests exceeding 1 MiB
-- **Key injection** — The real API key never enters the sandbox container
+- **Key injection** — The real API key never enters the sandbox container (Anthropic requests only)
 - **Structured logging** — JSON-formatted request logs for audit
 
 ## Security Hardening

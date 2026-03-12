@@ -5,6 +5,8 @@ import os
 import platform
 import socket
 import sys
+import urllib.error
+import urllib.request
 
 import anthropic
 
@@ -19,9 +21,57 @@ def _check_network_isolated() -> bool:
         return True
 
 
+def proxy_fetch(url: str, *, proxy_url: str | None = None) -> dict:
+    """
+    Fetch a URL through the proxy using the X-Target-Host header.
+
+    Parses the target URL, routes the request through the proxy,
+    and returns a dict with status, headers, and body.
+    """
+    proxy_url = proxy_url or os.environ.get("ANTHROPIC_PROXY_URL")
+    if not proxy_url:
+        return {"error": "No proxy URL configured (ANTHROPIC_PROXY_URL not set)"}
+
+    # Parse the target URL to extract host and path
+    from urllib.parse import urlparse
+
+    parsed = urlparse(url)
+    host = parsed.hostname
+    path = parsed.path or "/"
+    if parsed.query:
+        path += f"?{parsed.query}"
+
+    if not host:
+        return {"error": f"Could not parse host from URL: {url}"}
+
+    # Route through proxy with X-Target-Host header
+    proxy_request_url = f"{proxy_url.rstrip('/')}{path}"
+    req = urllib.request.Request(
+        proxy_request_url,
+        headers={"X-Target-Host": host, "User-Agent": "gvisor-sandbox-agent/1.0"},
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            body = resp.read()
+            return {
+                "status": resp.status,
+                "url": url,
+                "content_length": len(body),
+                "content_type": resp.headers.get("Content-Type", ""),
+                "body_preview": body[:500].decode("utf-8", errors="replace"),
+            }
+    except urllib.error.HTTPError as e:
+        error_body = e.read().decode("utf-8", errors="replace")
+        return {"status": e.code, "url": url, "error": error_body}
+    except Exception as e:
+        return {"url": url, "error": str(e)}
+
+
 def gather_env_info():
     """Collect runtime environment details to send as context."""
-    return {
+    proxy_url = os.environ.get("ANTHROPIC_PROXY_URL")
+    info = {
         "hostname": socket.gethostname(),
         "platform": platform.platform(),
         "architecture": platform.machine(),
@@ -31,9 +81,12 @@ def gather_env_info():
         "pid": os.getpid(),
         "writable_tmp": os.access("/tmp", os.W_OK),
         "writable_root": os.access("/", os.W_OK),
-        "proxied_mode": bool(os.environ.get("ANTHROPIC_PROXY_URL")),
+        "proxied_mode": bool(proxy_url),
         "network_isolated": _check_network_isolated(),
     }
+    if proxy_url:
+        info["proxy_url"] = proxy_url
+    return info
 
 
 def create_client() -> anthropic.Anthropic:
@@ -102,18 +155,64 @@ Keep your response concise — under 200 words."""
     print(message.content[0].text)
 
 
+def _handle_fetch_command(cmd: str) -> str | None:
+    """Handle !fetch <url> commands. Returns output string or None if not a fetch command."""
+    if not cmd.startswith("!fetch "):
+        return None
+
+    url = cmd[7:].strip()
+    if not url:
+        return "[fetch] Usage: !fetch <url>  (e.g., !fetch https://github.com)"
+
+    # Add https:// if no scheme provided
+    if not url.startswith(("http://", "https://")):
+        url = f"https://{url}"
+
+    result = proxy_fetch(url)
+
+    if "error" in result:
+        status = result.get("status", "N/A")
+        return f"[fetch] {url}\n  Status: {status}\n  Error: {result['error']}"
+
+    lines = [
+        f"[fetch] {url}",
+        f"  Status: {result['status']}",
+        f"  Content-Type: {result['content_type']}",
+        f"  Content-Length: {result['content_length']} bytes",
+        f"  Preview: {result['body_preview'][:200]}...",
+    ]
+    return "\n".join(lines)
+
+
 def run_interactive(client: anthropic.Anthropic, env_info: dict) -> None:
     """Interactive REPL — multi-turn conversation with Claude inside the sandbox."""
     env_context = "\n".join(f"- {k}: {v}" for k, v in env_info.items())
+    proxy_url = os.environ.get("ANTHROPIC_PROXY_URL")
+
     system_prompt = (
         "You are running inside a gVisor-sandboxed Docker container. "
         "Here is the runtime environment:\n\n"
         f"{env_context}\n\n"
-        "Answer the user's questions. You are aware of your sandboxed context."
+        "Answer the user's questions. You are aware of your sandboxed context.\n\n"
     )
 
+    if proxy_url:
+        system_prompt += (
+            "IMPORTANT: This container is network-isolated. Direct HTTP requests "
+            "and DNS lookups will fail. However, the user has a special REPL command "
+            "'!fetch <url>' that routes HTTP GET requests through the proxy to "
+            "whitelisted external hosts. Only hosts configured in the proxy's "
+            "PROXY_ALLOWED_EXTERNAL_HOSTS will succeed; others return 403. "
+            "When the user asks to fetch a URL or test connectivity, suggest they "
+            "use '!fetch <url>' (e.g., '!fetch https://google.com'). "
+            "Direct socket connections, ping, and DNS will always fail in this sandbox."
+        )
+
     messages: list[dict] = []
-    print("Interactive mode — type your prompts below. Ctrl+D or 'exit' to quit.\n")
+    print("Interactive mode — type your prompts below. Ctrl+D or 'exit' to quit.")
+    if proxy_url:
+        print("  Use '!fetch <url>' to make HTTP requests through the proxy.")
+    print()
 
     while True:
         try:
@@ -127,6 +226,15 @@ def run_interactive(client: anthropic.Anthropic, env_info: dict) -> None:
         if user_input.lower() in ("exit", "quit"):
             print("Bye.")
             break
+
+        # Handle !fetch commands locally (no Claude roundtrip needed)
+        fetch_output = _handle_fetch_command(user_input)
+        if fetch_output is not None:
+            print(f"\n{fetch_output}\n")
+            # Add fetch result to conversation so Claude has context
+            messages.append({"role": "user", "content": user_input})
+            messages.append({"role": "assistant", "content": fetch_output})
+            continue
 
         messages.append({"role": "user", "content": user_input})
 
