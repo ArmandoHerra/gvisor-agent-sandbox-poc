@@ -44,6 +44,8 @@ make prompt-proxied        # network-isolated mode
 ├── README.md                                 # This file
 ├── agent.py                                  # Claude SDK agent — probe mode and interactive REPL
 ├── changelog.md                              # Development changelog (FEAT-002, bug fixes)
+├── general_reports/                           # Research and analysis reports
+│   └── real_world_use_cases.md               # Real-world use cases for gVisor sandboxing
 ├── logs/                                     # Session logs (git-ignored, host-side only)
 │   └── .gitkeep                              # Keeps the directory tracked
 ├── proxy.py                                  # TCP reverse proxy — rate limiting, path allowlist, streaming
