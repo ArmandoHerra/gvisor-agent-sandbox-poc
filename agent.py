@@ -4,6 +4,7 @@
 import os
 import platform
 import socket
+import sys
 
 import anthropic
 
@@ -70,15 +71,16 @@ def create_client() -> anthropic.Anthropic:
     return client
 
 
-def main():
-    env_info = gather_env_info()
+def print_env(env_info: dict) -> None:
+    """Print container environment info."""
     print("=== Container Environment ===")
     for key, value in env_info.items():
         print(f"  {key}: {value}")
     print()
 
-    client = create_client()
 
+def run_probe(client: anthropic.Anthropic, env_info: dict) -> None:
+    """Run the default sandbox probe prompt."""
     prompt = f"""You are running inside a gVisor-sandboxed Docker container. Here is proof — the runtime environment data collected from inside your container:
 
 {chr(10).join(f'- {k}: {v}' for k, v in env_info.items())}
@@ -98,6 +100,61 @@ Keep your response concise — under 200 words."""
 
     print("=== Claude Response ===")
     print(message.content[0].text)
+
+
+def run_interactive(client: anthropic.Anthropic, env_info: dict) -> None:
+    """Interactive REPL — multi-turn conversation with Claude inside the sandbox."""
+    env_context = "\n".join(f"- {k}: {v}" for k, v in env_info.items())
+    system_prompt = (
+        "You are running inside a gVisor-sandboxed Docker container. "
+        "Here is the runtime environment:\n\n"
+        f"{env_context}\n\n"
+        "Answer the user's questions. You are aware of your sandboxed context."
+    )
+
+    messages: list[dict] = []
+    print("Interactive mode — type your prompts below. Ctrl+D or 'exit' to quit.\n")
+
+    while True:
+        try:
+            user_input = input("you> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\nBye.")
+            break
+
+        if not user_input:
+            continue
+        if user_input.lower() in ("exit", "quit"):
+            print("Bye.")
+            break
+
+        messages.append({"role": "user", "content": user_input})
+
+        response = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=1024,
+            system=system_prompt,
+            messages=messages,
+        )
+
+        reply = response.content[0].text
+        messages.append({"role": "assistant", "content": reply})
+
+        print(f"\nclaude> {reply}\n")
+
+
+def main():
+    interactive = "--interactive" in sys.argv
+
+    env_info = gather_env_info()
+    print_env(env_info)
+
+    client = create_client()
+
+    if interactive:
+        run_interactive(client, env_info)
+    else:
+        run_probe(client, env_info)
 
 
 if __name__ == "__main__":

@@ -18,7 +18,8 @@ PROXY_LOG    := /tmp/anthropic-proxy.log
 VENV         := .venv
 PYTHON       := $(VENV)/bin/python
 
-.PHONY: build build-proxy run run-proxied verify-gvisor clean help \
+.PHONY: build build-proxy run run-proxied prompt prompt-proxied \
+        verify-gvisor clean help \
         start-proxy stop-proxy proxy-status proxy-logs venv
 
 help: ## Show this help
@@ -53,6 +54,23 @@ run: build ## Run agent in gVisor sandbox (API key from host env)
 		--user 1000:1000 \
 		-e ANTHROPIC_API_KEY="$(ANTHROPIC_API_KEY)" \
 		$(IMAGE)
+
+prompt: build ## Interactive prompt — direct mode (API key from host env)
+	@test -n "$(ANTHROPIC_API_KEY)" || { echo "ERROR: ANTHROPIC_API_KEY is not set"; exit 1; }
+	docker run \
+		--runtime=$(RUNTIME) \
+		--rm -it \
+		--cap-drop ALL \
+		--security-opt no-new-privileges \
+		--read-only \
+		--tmpfs /tmp:rw,noexec,nosuid,size=$(TMP_SIZE) \
+		--tmpfs /workspace:rw,noexec,nosuid,size=$(WORK_SIZE) \
+		--memory $(MEMORY) \
+		--cpus $(CPUS) \
+		--pids-limit $(PIDS_LIMIT) \
+		--user 1000:1000 \
+		-e ANTHROPIC_API_KEY="$(ANTHROPIC_API_KEY)" \
+		$(IMAGE) --interactive
 
 start-proxy: build-proxy ## Start the proxy container (bridge + internal network)
 	@test -n "$(ANTHROPIC_API_KEY)" || { echo "ERROR: ANTHROPIC_API_KEY is not set"; exit 1; }
@@ -108,6 +126,27 @@ run-proxied: build start-proxy ## Run agent via proxy (gVisor sandbox, network-i
 		-e ANTHROPIC_PROXY_URL="http://proxy-host:$(PROXY_PORT)" \
 		-e ANTHROPIC_API_KEY="proxied" \
 		$(IMAGE)
+
+prompt-proxied: build start-proxy ## Interactive prompt — network-isolated via proxy
+	@PROXY_IP=$$(docker inspect -f '{{json .NetworkSettings.Networks}}' $(PROXY_NAME) | python3 -c "import sys,json; print(json.loads(sys.stdin.read())['$(PROXY_NET)']['IPAddress'])") && \
+	echo "Proxy IP on $(PROXY_NET): $$PROXY_IP" && \
+	docker run \
+		--runtime=$(RUNTIME) \
+		--rm -it \
+		--network=$(PROXY_NET) \
+		--cap-drop ALL \
+		--security-opt no-new-privileges \
+		--read-only \
+		--tmpfs /tmp:rw,noexec,nosuid,size=$(TMP_SIZE) \
+		--tmpfs /workspace:rw,noexec,nosuid,size=$(WORK_SIZE) \
+		--memory $(MEMORY) \
+		--cpus $(CPUS) \
+		--pids-limit $(PIDS_LIMIT) \
+		--user 1000:1000 \
+		--add-host=proxy-host:$$PROXY_IP \
+		-e ANTHROPIC_PROXY_URL="http://proxy-host:$(PROXY_PORT)" \
+		-e ANTHROPIC_API_KEY="proxied" \
+		$(IMAGE) --interactive
 
 verify-gvisor: build ## Verify gVisor runtime via dmesg output
 	docker run --runtime=$(RUNTIME) --rm --entrypoint python $(IMAGE) \
