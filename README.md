@@ -47,6 +47,7 @@ make prompt-proxied        # network-isolated mode
 ├── proxy_config.py                           # Proxy configuration with env var overrides and validation
 ├── requirements-proxy.txt                    # Proxy Python dependencies
 ├── specs/
+│   ├── container-sandbox-logging-capture-spec.md # FEAT-002: Logging & capture spec
 │   └── network-isolated-sandbox-proxy-spec.md  # FEAT-001: Proxy implementation spec
 └── tests/
     ├── __init__.py
