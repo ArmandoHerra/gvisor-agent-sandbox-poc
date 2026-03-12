@@ -52,6 +52,8 @@ make prompt-proxied        # network-isolated mode
 ├── scripts/
 │   ├── capture-logs.sh                       # Session orchestrator — creates log dir, runs container, captures logs
 │   └── merge-logs.sh                         # Post-mortem log merger — combines agent/proxy/events into session.log
+├── improvement_reports/                      # Architecture analysis and security investigation reports
+│   └── 20260312_report.md                    # Feature improvements (FEAT-003–007) + security tests (SEC-001–020)
 ├── specs/
 │   ├── container-sandbox-logging-capture-spec.md # FEAT-002: Logging & capture spec
 │   └── network-isolated-sandbox-proxy-spec.md  # FEAT-001: Proxy implementation spec
