@@ -36,16 +36,21 @@ make prompt-proxied        # network-isolated mode
 
 ```
 .
-├── .env.example                              # Environment template (API key + proxy settings)
+├── .env.example                              # Environment template (API key + proxy + logging settings)
 ├── .gitignore                                # Git ignore rules
 ├── Dockerfile                                # Agent image — Python 3.12 slim, non-root user
 ├── Dockerfile.proxy                          # Proxy image — aiohttp reverse proxy
-├── Makefile                                  # Build/run/proxy lifecycle targets
+├── Makefile                                  # Build/run/proxy/logging lifecycle targets
 ├── README.md                                 # This file
 ├── agent.py                                  # Claude SDK agent — probe mode and interactive REPL
+├── logs/                                     # Session logs (git-ignored, host-side only)
+│   └── .gitkeep                              # Keeps the directory tracked
 ├── proxy.py                                  # TCP reverse proxy — rate limiting, path allowlist, streaming
 ├── proxy_config.py                           # Proxy configuration with env var overrides and validation
 ├── requirements-proxy.txt                    # Proxy Python dependencies
+├── scripts/
+│   ├── capture-logs.sh                       # Session orchestrator — creates log dir, runs container, captures logs
+│   └── merge-logs.sh                         # Post-mortem log merger — combines agent/proxy/events into session.log
 ├── specs/
 │   ├── container-sandbox-logging-capture-spec.md # FEAT-002: Logging & capture spec
 │   └── network-isolated-sandbox-proxy-spec.md  # FEAT-001: Proxy implementation spec
@@ -74,6 +79,27 @@ make prompt-proxied        # network-isolated mode
 | `make venv` | Create virtualenv and install proxy dependencies locally |
 | `make verify-gvisor` | Verify gVisor runtime via dmesg output |
 | `make clean` | Remove images, network, and clean up |
+
+### Logged Run Targets
+
+| Command | Description |
+|---------|-------------|
+| `make run-logged` | Run agent (direct mode) — captures logs to `logs/` |
+| `make run-proxied-logged` | Run agent via proxy — captures agent + proxy logs to `logs/` |
+| `make prompt-logged` | Interactive REPL (direct mode) with log capture |
+| `make prompt-proxied-logged` | Interactive REPL (proxied mode) with log capture |
+
+### Log Review and Maintenance
+
+| Command | Description |
+|---------|-------------|
+| `make logs-list` | List all captured sessions with status, exit code, and duration |
+| `make logs-latest` | Display the most recent session's merged log |
+| `make logs-review SESSION=<id>` | Display a specific session's merged log |
+| `make logs-events SESSION=<id>` | Show Docker runtime events for a session (OOM, signals, exit codes) |
+| `make logs-merge SESSION=<id>` | Regenerate `session.log` for a session (if merge was interrupted) |
+| `make logs-clean` | Remove sessions older than `LOG_RETENTION_DAYS` (default: 30 days) |
+| `make logs-clean-all` | Remove all session logs (keeps `logs/.gitkeep`) |
 
 ## Configuration
 
@@ -106,6 +132,89 @@ make prompt-proxied        # network-isolated mode
 | `TMP_SIZE` | `100m` | Writable /tmp size |
 | `WORK_SIZE` | `500m` | Writable /workspace size |
 | `PROXY_PORT` | `18080` | Proxy TCP port |
+
+## Logging
+
+The logging system captures all container stdout/stderr, Docker runtime events, and session metadata to disk for post-mortem analysis. It runs entirely on the host using shell pipelines — no changes to Docker images or Python dependencies.
+
+### How It Works
+
+Each `make *-logged` target invokes `scripts/capture-logs.sh`, which:
+
+1. Generates a unique session ID (`YYYYMMDD-HHMMSS-<mode>`)
+2. Creates `logs/<session-id>/` with a `metadata.json` (start time, config, host info)
+3. Updates the `logs/latest` symlink
+4. Starts background collectors: `docker events` (runtime events) and `docker logs --follow` (proxy, in proxied mode)
+5. Runs the agent container — output is streamed to both the terminal and `agent.log` in real-time
+6. On exit: kills collectors, reads the container exit code, updates `metadata.json`, and merges logs into `session.log`
+
+### Session Directory Layout
+
+```
+logs/
++-- 20260312-143022-proxied/
+|   +-- metadata.json     # Session ID, mode, timestamps, exit code, host info
+|   +-- agent.log         # Agent container stdout + stderr
+|   +-- proxy.log         # Proxy container stdout + stderr (proxied mode only)
+|   +-- events.log        # Docker runtime events (start/stop/OOM/kill) as JSON lines
+|   +-- session.log       # Merged + time-sorted log (all sources combined)
++-- 20260312-143155-direct/
+|   +-- metadata.json
+|   +-- agent.log
+|   +-- events.log        # No proxy.log in direct mode
++-- latest -> 20260312-143022-proxied  # Symlink to most recent session
+```
+
+The `logs/` directory is git-ignored (contents are ephemeral). Only `logs/.gitkeep` is tracked.
+
+### Post-Mortem Workflow
+
+```bash
+# 1. Run with logging
+make run-proxied-logged
+
+# 2. List all sessions
+make logs-list
+
+# 3. Review the latest session's merged log
+make logs-latest
+
+# 4. Review a specific session
+make logs-review SESSION=20260312-143022-proxied
+
+# 5. Check runtime events (OOM kills, signals, exit codes)
+make logs-events SESSION=20260312-143022-proxied
+
+# 6. Search across all sessions
+grep -r "OOM" logs/*/events.log
+grep -r "exit_code" logs/*/metadata.json
+
+# 7. Regenerate session.log if merge was interrupted
+make logs-merge SESSION=20260312-143022-proxied
+
+# 8. Clean up old sessions
+make logs-clean         # removes sessions older than LOG_RETENTION_DAYS
+make logs-clean-all     # removes all session logs
+```
+
+### Crash Detection
+
+A session with `"ended_at": null` in `metadata.json` indicates an incomplete session (crash, power loss, or daemon failure). `make logs-list` flags these as `INCOMPLETE`. An exit code of `137` indicates an OOM kill.
+
+### Logging Configuration
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `LOG_DIR` | `logs` | Base directory for session logs |
+| `LOG_RETENTION_DAYS` | `30` | Days before `make logs-clean` removes a session |
+| `SANDBOX_LOG_ENABLED` | _(empty)_ | Set to `1` to redirect base `run`/`prompt` targets to logged variants |
+| `LOG_TIMESTAMPS` | `1` | Set to `1` to inject ISO 8601 timestamps into agent log lines |
+
+Set these in `.env` or export them before running make:
+
+```bash
+LOG_RETENTION_DAYS=7 make run-logged
+```
 
 ## Architecture
 

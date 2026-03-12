@@ -30,7 +30,7 @@ class ProxyConfig:
 
     # Timeouts (seconds)
     upstream_connect_timeout: float = 10.0
-    upstream_read_timeout: float = 300.0  # 5 min for streaming responses
+    upstream_read_timeout: float = 900.0  # 15 min for long streaming responses
 
     # Logging
     log_level: str = "INFO"

@@ -9,6 +9,7 @@ import urllib.error
 import urllib.request
 
 import anthropic
+import httpx
 
 
 def _check_network_isolated() -> bool:
@@ -145,14 +146,18 @@ Based on this environment data, do the following:
 
 Keep your response concise — under 200 words."""
 
-    message = client.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=512,
-        messages=[{"role": "user", "content": prompt}],
-    )
-
     print("=== Claude Response ===")
-    print(message.content[0].text)
+    try:
+        with client.messages.stream(
+            model="claude-opus-4-6",
+            max_tokens=512,
+            messages=[{"role": "user", "content": prompt}],
+        ) as stream:
+            for text in stream.text_stream:
+                print(text, end="", flush=True)
+    except (httpx.RemoteProtocolError, httpx.ReadError) as exc:
+        print(f"\n\n[stream interrupted: {exc}]")
+    print()
 
 
 def _handle_fetch_command(cmd: str) -> str | None:
@@ -238,17 +243,28 @@ def run_interactive(client: anthropic.Anthropic, env_info: dict) -> None:
 
         messages.append({"role": "user", "content": user_input})
 
-        response = client.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=1024,
-            system=system_prompt,
-            messages=messages,
-        )
+        print("\nclaude> ", end="", flush=True)
+        reply_parts: list[str] = []
+        try:
+            with client.messages.stream(
+                model="claude-opus-4-6",
+                max_tokens=32768,  # max for claude-opus-4-6 (sonnet-4-6 max is 16384)
+                system=system_prompt,
+                messages=messages,
+            ) as stream:
+                for text in stream.text_stream:
+                    print(text, end="", flush=True)
+                    reply_parts.append(text)
+        except (httpx.RemoteProtocolError, httpx.ReadError) as exc:
+            print(f"\n\n[stream interrupted: {exc}]")
+        print("\n")
 
-        reply = response.content[0].text
-        messages.append({"role": "assistant", "content": reply})
-
-        print(f"\nclaude> {reply}\n")
+        reply = "".join(reply_parts)
+        if reply:
+            messages.append({"role": "assistant", "content": reply})
+        else:
+            # Remove the user message if we got no response at all
+            messages.pop()
 
 
 def main():

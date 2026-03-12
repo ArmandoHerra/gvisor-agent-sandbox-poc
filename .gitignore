@@ -23,3 +23,7 @@ target/
 # OS
 .DS_Store
 Thumbs.db
+
+# Session logs (host-side only — contents are ephemeral)
+logs/*
+!logs/.gitkeep

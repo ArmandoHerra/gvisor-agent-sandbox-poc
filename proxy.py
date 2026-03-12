@@ -271,7 +271,8 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
     try:
         timeout = aiohttp.ClientTimeout(
             connect=config.upstream_connect_timeout,
-            total=config.upstream_read_timeout,
+            sock_read=config.upstream_read_timeout,
+            total=None,
         )
         async with upstream_session.request(
             method=request.method,
