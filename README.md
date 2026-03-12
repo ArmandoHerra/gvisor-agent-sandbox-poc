@@ -14,6 +14,10 @@ make run
 
 # 3. Or run network-isolated via proxy
 make run-proxied
+
+# 4. Interactive REPL — multi-turn conversation inside sandbox
+make prompt                # direct mode
+make prompt-proxied        # network-isolated mode
 ```
 
 ## Tech Stack
@@ -38,7 +42,7 @@ make run-proxied
 ├── Dockerfile.proxy                          # Proxy image — aiohttp reverse proxy
 ├── Makefile                                  # Build/run/proxy lifecycle targets
 ├── README.md                                 # This file
-├── agent.py                                  # Claude SDK agent — probes sandbox and queries Claude
+├── agent.py                                  # Claude SDK agent — probe mode and interactive REPL
 ├── proxy.py                                  # TCP reverse proxy — rate limiting, path allowlist, streaming
 ├── proxy_config.py                           # Proxy configuration with env var overrides and validation
 ├── requirements-proxy.txt                    # Proxy Python dependencies
@@ -60,6 +64,8 @@ make run-proxied
 | `make build-proxy` | Build the proxy Docker image |
 | `make run` | Build and run agent in gVisor sandbox (API key from env) |
 | `make run-proxied` | Build agent + start proxy, run agent network-isolated via proxy |
+| `make prompt` | Interactive REPL — direct mode (API key from env) |
+| `make prompt-proxied` | Interactive REPL — network-isolated via proxy |
 | `make start-proxy` | Start the proxy container (bridge + internal network) |
 | `make stop-proxy` | Stop the proxy container |
 | `make proxy-status` | Check if the proxy container is running |
@@ -147,11 +153,20 @@ The `run-proxied` target adds **network isolation** — the agent container can 
 
 ## How It Works
 
+### Probe Mode (default)
+
 1. `agent.py` collects runtime environment info (hostname, platform, filesystem permissions, network state, proxy mode)
 2. If `ANTHROPIC_PROXY_URL` is set, the client routes through the proxy; otherwise connects directly
 3. Sends environment data to Claude via the Anthropic SDK
 4. Claude analyzes the sandbox restrictions and suggests boundary-testing experiments
 5. Output is printed to stdout
+
+### Interactive Mode (`--interactive`)
+
+1. Same environment collection and client setup as probe mode
+2. Opens a multi-turn REPL with `you>` / `claude>` prompts
+3. Claude receives the sandbox environment as a system prompt and maintains conversation history
+4. Exit with `Ctrl+D`, `exit`, or `quit`
 
 ## Testing
 
