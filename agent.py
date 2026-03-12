@@ -4,7 +4,18 @@
 import os
 import platform
 import socket
+
 import anthropic
+
+
+def _check_network_isolated() -> bool:
+    """Test if we can reach the public internet (not just the proxy)."""
+    try:
+        s = socket.create_connection(("8.8.8.8", 53), timeout=2)
+        s.close()
+        return False
+    except (OSError, socket.timeout):
+        return True
 
 
 def gather_env_info():
@@ -19,26 +30,54 @@ def gather_env_info():
         "pid": os.getpid(),
         "writable_tmp": os.access("/tmp", os.W_OK),
         "writable_root": os.access("/", os.W_OK),
-        "network_isolated": not os.path.exists("/etc/resolv.conf") or os.path.getsize("/etc/resolv.conf") == 0,
+        "proxied_mode": bool(os.environ.get("ANTHROPIC_PROXY_URL")),
+        "network_isolated": _check_network_isolated(),
     }
 
 
-def main():
+def create_client() -> anthropic.Anthropic:
+    """
+    Create an Anthropic client.
+
+    If ANTHROPIC_PROXY_URL is set, route requests through the host-side
+    proxy via TCP. The proxy injects the real API key and forwards to
+    the upstream Anthropic API.
+
+    If not set, fall back to standard direct connection.
+    """
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
         print("ERROR: ANTHROPIC_API_KEY is not set")
         raise SystemExit(1)
 
+    proxy_url = os.environ.get("ANTHROPIC_PROXY_URL")
+
+    if proxy_url:
+        # Proxied mode — route through host-side proxy via TCP
+        client = anthropic.Anthropic(
+            api_key=api_key,
+            base_url=proxy_url,
+        )
+    else:
+        # Direct mode — connect to Anthropic API directly
+        client = anthropic.Anthropic(
+            api_key=api_key,
+            base_url=os.environ.get(
+                "ANTHROPIC_BASE_URL", "https://api.anthropic.com"
+            ),
+        )
+
+    return client
+
+
+def main():
     env_info = gather_env_info()
     print("=== Container Environment ===")
     for key, value in env_info.items():
         print(f"  {key}: {value}")
     print()
 
-    client = anthropic.Anthropic(
-        api_key=api_key,
-        base_url=os.environ.get("ANTHROPIC_BASE_URL", "https://api.anthropic.com"),
-    )
+    client = create_client()
 
     prompt = f"""You are running inside a gVisor-sandboxed Docker container. Here is proof — the runtime environment data collected from inside your container:
 
@@ -59,6 +98,7 @@ Keep your response concise — under 200 words."""
 
     print("=== Claude Response ===")
     print(message.content[0].text)
+
 
 if __name__ == "__main__":
     main()

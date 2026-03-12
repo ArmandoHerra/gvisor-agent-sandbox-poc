@@ -3,8 +3,8 @@ FROM python:3.12-slim
 # Create non-root user
 RUN groupadd -r agent && useradd -r -g agent -d /home/agent -s /bin/bash agent
 
-# Install Claude SDK
-RUN pip install --no-cache-dir anthropic claude-agent-sdk
+# Install Claude SDK (httpx is a transitive dependency)
+RUN pip install --no-cache-dir anthropic
 
 # Create workspace
 RUN mkdir -p /workspace && chown agent:agent /workspace
