@@ -198,7 +198,8 @@ The `run-proxied` target adds **network isolation** — the agent container can 
 1. Same environment collection and client setup as probe mode
 2. Opens a multi-turn REPL with `you>` / `claude>` prompts
 3. Claude receives the sandbox environment as a system prompt and maintains conversation history
-4. Exit with `Ctrl+D`, `exit`, or `quit`
+4. In proxied mode, use `!fetch <url>` to make HTTP GET requests through the proxy to whitelisted external hosts
+5. Exit with `Ctrl+D`, `exit`, or `quit`
 
 ## Testing
 
@@ -223,7 +224,9 @@ Tests cover:
 - Path allowlist enforcement
 - Request body size limits
 - Upstream request forwarding and streaming
+- External host routing (allowlist, blocking, case-insensitive matching)
 - Agent client creation (direct and proxied modes)
+- `proxy_fetch()` and `!fetch` REPL command handling
 - Network isolation detection
 
 ## Prerequisites
