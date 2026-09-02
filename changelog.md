@@ -1,5 +1,157 @@
 # Changelog
 
+## [Fix: OpenAI run_shell tool 400 on reasoning models] - 2026-09-02
+
+### Fixed
+- The model-callable `run_shell` tool failed on `gpt-5.6-sol` with
+  `400 invalid_request_error`: "Function tools with reasoning_effort are not
+  supported for gpt-5.6-sol in /v1/chat/completions." gpt-5.x reasoning models
+  reject function tools alongside reasoning in Chat Completions. Fix: the OpenAI
+  tool loop now sends `reasoning_effort='none'` (the documented remedy; the other
+  option is the /v1/responses API). Configurable via `OPENAI_REASONING_EFFORT`
+  (default `none`, threaded through the run/prompt/openai-proxied targets);
+  set it to `omit` for non-reasoning models that reject the parameter. Empty
+  values fall back to `none`, so an unset Makefile passthrough stays safe.
+- Added a mocked OpenAI tool-loop test asserting `reasoning_effort` is sent —
+  it reproduces and guards this regression without an API call.
+
+## [Model-callable run_shell tool (native tool-calling)] - 2026-09-02
+
+### Added
+- **`ALLOW_SHELL_TOOL=1`** — a second, independent shell knob alongside
+  `ALLOW_SHELL`. Where `!exec` is operator-driven, this advertises a `run_shell`
+  tool the model calls **autonomously** via native tool-calling. `agent.py`
+  runs a bounded model → tool-call → tool-result loop (`_run_tool_turn`) with
+  provider-specific implementations: Anthropic `tool_use`/`tool_result` over the
+  streaming API, OpenAI `tool_calls`/`tool` role over Chat Completions. Both
+  share the `_run_shell` executor with `!exec` (same `SHELL_TIMEOUT`, same
+  `/workspace` cwd, same container hardening). Wired into probe + REPL; the env
+  block reports `shell_tool_enabled`.
+- Knob plumbed through the six run/prompt targets and `capture-logs.sh`;
+  documented in `.env.example` and the README "Capabilities & Permissions"
+  section (both shell modes explained).
+- `make clean-agents` — removes stray agent containers (e.g. after a closed
+  terminal); interactive targets use `--rm` so this is only for genuinely stuck
+  containers.
+
+### Notes
+- **Live-validated (Anthropic):** with `ALLOW_SHELL_TOOL=1`, claude-sonnet-5
+  called `run_shell("id")` unprompted → `uid=1000` → produced its final answer.
+  End-to-end wire format confirmed against the real API. The OpenAI loop is built
+  symmetrically and unit-tested; validate it with `ALLOW_SHELL_TOOL=1 make run-openai`.
+- Cross-turn history stores each turn's **final text** (not the intermediate
+  tool_use/tool_result blocks), keeping the shared REPL conversation
+  provider-neutral; the tool exchange is complete within a single turn.
+- Loop is bounded (`max_iters=6`) so a tool-happy model can't spin forever.
+- Suite 42 → 48 (executor, schema, gating, and a mocked Anthropic tool-loop
+  test that needs no API).
+
+## [Provider-neutral container names] - 2026-09-02
+
+### Changed
+- Renamed the images now that the agent is multi-provider: agent
+  `claude-agent` → `sandbox-agent` (Makefile `IMAGE_NAME`, `capture-logs.sh`
+  default + `sandbox-agent-<session>` container name), proxy `anthropic-proxy`
+  → `llm-proxy` (Makefile `PROXY_IMAGE`/`PROXY_NAME`/`PROXY_LOG`, capture-logs
+  default + metadata). README Makefile-variable defaults updated. All references
+  were variable-driven, so targets pick up the new names automatically; old
+  `claude-agent`/`anthropic-proxy` images and any running `anthropic-proxy`
+  container are obsolete (remove with `docker rm -f anthropic-proxy` +
+  `docker rmi claude-agent:latest anthropic-proxy:latest`).
+
+## [Opt-in agent capabilities: shell exec + container permission knobs] - 2026-09-02
+
+### Added
+- **`!exec <cmd>` REPL command** (`agent.py`), operator-driven like `!fetch` and
+  gated by `ALLOW_SHELL=1` (default off). Runs the command in the container with
+  a `SHELL_TIMEOUT`-second cap (default 30) and truncated output; the model can
+  suggest commands but the operator runs them. The probe/REPL env block now
+  reports `shell_enabled`, and the system prompt tells the model the operator
+  can run `!exec` when it is enabled.
+- **Container permission knobs** (Makefile, secure defaults), applied to the
+  plain `run`/`prompt` targets and their provider/proxied variants:
+  - `WORKSPACE_EXEC=1` — lets the agent run scripts it writes to `/workspace`.
+  - `CAP_ADD=<caps>` — comma-separated Linux capabilities.
+  - `RUN_AS_ROOT=1` — run as uid 0 (still gVisor-contained).
+  - `ALLOW_SHELL` / `SHELL_TIMEOUT` also plumb through `capture-logs.sh`.
+- README **"Capabilities & Permissions (for experimenting)"** section documenting
+  every knob, verified behavior, and examples.
+
+### Notes (empirically verified against runsc)
+- `noexec` is enforced by gVisor: a script in `/workspace` gets `EACCES` on
+  `execve`. Dropping the word `noexec` from `--tmpfs` is **not** enough — the
+  mount defaults back to `noexec`; `WORKSPACE_EXEC=1` passes the explicit `exec`
+  option, which does remove it (mount → `rw,nosuid`, exec succeeds).
+- `--cap-add` alone adds a capability to the **bounding** set (`CapBnd`) but a
+  non-root agent keeps `CapEff: 0` — the cap is not usable. `RUN_AS_ROOT=1`
+  promotes it into the effective set (`CapEff`). So CAP_ADD is paired with
+  RUN_AS_ROOT to actually grant a usable capability.
+- Renamed the proxy logger `anthropic_proxy` → `llm_proxy` (it serves both
+  providers now; the per-request log already tags `provider`).
+
+## [Proxied OpenAI + per-provider make targets] - 2026-09-02
+
+### Added
+- **OpenAI traffic can now run network-isolated through the proxy**, matching the
+  guarantee the proxy already gave Anthropic. The proxy routes by request path:
+  Anthropic paths → `api.anthropic.com` + injected `x-api-key`; OpenAI paths
+  (`/v1/chat/completions`, `/v1/responses`) → `api.openai.com` + injected
+  `Authorization: Bearer`. One proxy container serves both; `start-proxy` passes
+  whichever keys are set. The real key never enters the sandbox for either
+  provider. Live-validated: both paths reached their real upstreams (401 on fake
+  keys), disallowed paths 403 without forwarding.
+- Dedicated per-provider make targets so no env vars need setting by hand:
+  `run-openai`, `prompt-openai` (direct) and `run-openai-proxied`,
+  `prompt-openai-proxied` (network-isolated). The existing `run`/`prompt`/
+  `run-proxied`/`prompt-proxied` remain the Anthropic set.
+- `proxy_config.py`: `openai_api_key`, `openai_base_url`
+  (`PROXY_OPENAI_UPSTREAM_URL`), `openai_allowed_paths`
+  (`PROXY_OPENAI_ALLOWED_PATHS`); validation now requires at least one provider
+  key. Agent: `OPENAI_PROXY_URL` pins the OpenAI client base to `<proxy>/v1`;
+  proxied-mode detection, `proxy_fetch`, and the REPL system prompt recognize
+  either provider's proxy var.
+
+### Notes
+- Proxy header injection is case-safe (`_set_header`/`_strip_header`): the OpenAI
+  branch strips any client-sent `x-api-key`; the Anthropic branch strips any
+  client-sent `Authorization` — neither provider's credential leaks onto the
+  other's request.
+- Selecting OpenAI inside an Anthropic-proxied context without `OPENAI_PROXY_URL`
+  is refused (would try a direct `api.openai.com` call from a network-isolated
+  container and fail) — the dedicated `run-openai-proxied` target sets it.
+- Suite grew 29 → 37 (OpenAI routing + config + agent proxied-base_url tests).
+
+## [Multi-provider support — OpenAI + provider switch] - 2026-09-02
+
+### Added
+- OpenAI provider alongside Anthropic. `agent.py` now resolves a provider and
+  model at startup: `LLM_PROVIDER` (`anthropic`|`openai`) is an explicit switch;
+  unset, it auto-detects from which key is present; when both keys are set,
+  Anthropic wins. Per-provider model defaults `claude-sonnet-5` / `gpt-5.6-sol`,
+  overridable via `ANTHROPIC_MODEL` / `OPENAI_MODEL`. Active provider + model are
+  reported in the probe's environment block.
+- Unified streaming layer (`stream_reply` → `_stream_anthropic` / `_stream_openai`)
+  so probe and REPL are provider-agnostic. OpenAI uses Chat Completions with
+  streaming; refusals surface via `delta.refusal` or `finish_reason ==
+  "content_filter"`, mirroring the Anthropic `stop_reason == "refusal"` notice.
+- `OPENAI_API_KEY`, `OPENAI_MODEL`, `OPENAI_MAX_TOKENS`, `LLM_PROVIDER` env vars
+  threaded through the direct-mode Makefile targets and `capture-logs.sh`;
+  `.env.example` and the README document them. `openai` added to the Dockerfile
+  and `requirements-dev.txt`.
+
+### Notes
+- **Proxied mode stays Anthropic-only** — the proxy injects the Anthropic key and
+  forwards to `api.anthropic.com`. `create_client` refuses `openai` + a set
+  `ANTHROPIC_PROXY_URL` rather than misrouting.
+- The `openai` import is lazy (only when the OpenAI provider is active), so
+  Anthropic-only runs and the test suite don't require it at import time.
+- `create_client()` keeps its no-arg signature (resolves the provider itself),
+  so the existing transport tests are unchanged — suite still 29 green.
+- gpt-5.6-sol and its API surface postdate this code: Chat Completions +
+  `max_completion_tokens` is the assumed shape (sent only when
+  `OPENAI_MAX_TOKENS` is set). Verify against current OpenAI docs if a call
+  fails; `MAX_TOKENS = 128000` remains the Anthropic-only output cap.
+
 ## [First-time setup validation — dependency fixes] - 2026-09-01
 
 ### Fixed

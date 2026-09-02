@@ -119,6 +119,26 @@ class TestProxyConfig:
         errors = config.validate()
         assert errors == []
 
+    def test_validate_openai_only(self):
+        """A proxy configured with only an OpenAI key is valid."""
+        config = ProxyConfig(anthropic_api_key="", openai_api_key="sk-oai-valid")
+        assert config.validate() == []
+
+    def test_openai_defaults(self):
+        config = ProxyConfig()
+        assert config.openai_base_url == "https://api.openai.com"
+        assert "/v1/chat/completions" in config.openai_allowed_paths
+
+    def test_from_env_openai(self):
+        env = {
+            "OPENAI_API_KEY": "sk-oai-test",
+            "PROXY_OPENAI_ALLOWED_PATHS": "/v1/chat/completions,/v1/responses",
+        }
+        with patch.dict(os.environ, env, clear=False):
+            config = ProxyConfig.from_env()
+        assert config.openai_api_key == "sk-oai-test"
+        assert config.openai_allowed_paths == ["/v1/chat/completions", "/v1/responses"]
+
 
 # ---------------------------------------------------------------------------
 # Rate limiter tests
@@ -219,6 +239,75 @@ class TestHandlers:
         call_kwargs = mock_session.request.call_args
         assert "api.anthropic.com" in call_kwargs.kwargs["url"]
         assert call_kwargs.kwargs["headers"]["x-api-key"] == "sk-ant-test-key-1234567890"
+
+
+# ---------------------------------------------------------------------------
+# OpenAI routing tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestOpenAIRouting:
+    def _config(self, **overrides):
+        base = dict(
+            anthropic_api_key="sk-ant-test-key-1234567890",
+            openai_api_key="sk-oai-test-key-9876543210",
+            allowed_paths=["/v1/messages"],
+            rate_limit_requests_per_minute=120,
+            rate_limit_burst=20,
+            max_request_body_bytes=1024,
+            log_format="text",
+        )
+        base.update(overrides)
+        return ProxyConfig(**base)
+
+    async def test_openai_path_forwards_with_bearer(self, aiohttp_client):
+        app, mock_session, _ = _app_with_mock_upstream(self._config())
+        client = await aiohttp_client(app)
+
+        resp = await client.post(
+            "/v1/chat/completions",
+            data=b'{"model":"gpt-5.6-sol"}',
+            headers={"Content-Type": "application/json"},
+        )
+        assert resp.status == 200
+
+        call = mock_session.request.call_args
+        assert "api.openai.com" in call.kwargs["url"]
+        assert call.kwargs["headers"]["Authorization"] == "Bearer sk-oai-test-key-9876543210"
+        # The Anthropic key must not leak on an OpenAI request
+        assert "x-api-key" not in {k.lower() for k in call.kwargs["headers"]}
+
+    async def test_openai_path_without_key_returns_403(self, aiohttp_client):
+        config = self._config(openai_api_key="")
+        app = create_app(config)
+        client = await aiohttp_client(app)
+        resp = await client.post(
+            "/v1/chat/completions",
+            data=b"{}",
+            headers={"Content-Type": "application/json"},
+        )
+        assert resp.status == 403
+        data = await resp.json()
+        assert data["error"]["type"] == "forbidden"
+
+    async def test_anthropic_path_unaffected_when_openai_configured(self, aiohttp_client):
+        """Regression: Anthropic routing is unchanged when OpenAI is also enabled."""
+        app, mock_session, _ = _app_with_mock_upstream(self._config())
+        client = await aiohttp_client(app)
+
+        resp = await client.post(
+            "/v1/messages",
+            data=b'{"model":"claude"}',
+            headers={"Content-Type": "application/json"},
+        )
+        assert resp.status == 200
+
+        call = mock_session.request.call_args
+        assert "api.anthropic.com" in call.kwargs["url"]
+        assert call.kwargs["headers"]["x-api-key"] == "sk-ant-test-key-1234567890"
+        # No stray OpenAI Bearer on an Anthropic request
+        assert "authorization" not in {k.lower() for k in call.kwargs["headers"]}
 
 
 # ---------------------------------------------------------------------------

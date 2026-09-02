@@ -13,11 +13,19 @@ class ProxyConfig:
     listen_host: str = "0.0.0.0"
     listen_port: int = 18080
 
-    # Upstream settings
+    # Anthropic upstream settings
     upstream_base_url: str = "https://api.anthropic.com"
     anthropic_api_key: str = ""
 
-    # Security settings
+    # OpenAI upstream settings (optional — routing enabled when the key is set)
+    openai_api_key: str = ""
+    openai_base_url: str = "https://api.openai.com"
+    openai_allowed_paths: list[str] = field(default_factory=lambda: [
+        "/v1/chat/completions",
+        "/v1/responses",
+    ])
+
+    # Security settings — Anthropic path allowlist
     allowed_paths: list[str] = field(default_factory=lambda: [
         "/v1/messages",
         "/v1/complete",
@@ -50,6 +58,10 @@ class ProxyConfig:
             "PROXY_UPSTREAM_URL", config.upstream_base_url
         )
         config.anthropic_api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+        config.openai_api_key = os.environ.get("OPENAI_API_KEY", "")
+        config.openai_base_url = os.environ.get(
+            "PROXY_OPENAI_UPSTREAM_URL", config.openai_base_url
+        )
         config.max_request_body_bytes = int(
             os.environ.get("PROXY_MAX_BODY_BYTES", str(config.max_request_body_bytes))
         )
@@ -87,13 +99,21 @@ class ProxyConfig:
                 h.strip().lower() for h in external_hosts.split(",") if h.strip()
             ]
 
+        openai_allowed = os.environ.get("PROXY_OPENAI_ALLOWED_PATHS")
+        if openai_allowed:
+            config.openai_allowed_paths = [
+                p.strip() for p in openai_allowed.split(",") if p.strip()
+            ]
+
         return config
 
     def validate(self) -> list[str]:
         """Return a list of validation errors. Empty list means valid."""
         errors = []
-        if not self.anthropic_api_key:
-            errors.append("ANTHROPIC_API_KEY is required")
+        if not self.anthropic_api_key and not self.openai_api_key:
+            errors.append(
+                "At least one of ANTHROPIC_API_KEY / OPENAI_API_KEY is required"
+            )
         if not self.listen_host:
             errors.append("listen_host is required")
         if not (1 <= self.listen_port <= 65535):

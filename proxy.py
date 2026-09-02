@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
 """
-Anthropic API Proxy — Unix Domain Socket Reverse Proxy.
+LLM API Proxy — TCP reverse proxy for Anthropic and/or OpenAI.
 
-Runs on the host, listens on a Unix domain socket, injects the real
-ANTHROPIC_API_KEY, and forwards requests to https://api.anthropic.com.
+Runs on the host, injects the real API key, and forwards requests upstream.
+Routing is by request path: Anthropic paths go to https://api.anthropic.com
+with an injected x-api-key; OpenAI paths go to https://api.openai.com with an
+injected Authorization: Bearer token. External hosts (X-Target-Host) are
+forwarded verbatim with no key injection.
 
 Usage:
     python proxy.py                          # Uses defaults + env vars
     ANTHROPIC_API_KEY=sk-ant-... python proxy.py
+    OPENAI_API_KEY=sk-...      python proxy.py   # enables OpenAI routing
 """
 
 import asyncio
@@ -28,7 +32,7 @@ from proxy_config import ProxyConfig
 # Logging setup
 # ---------------------------------------------------------------------------
 
-logger = logging.getLogger("anthropic_proxy")
+logger = logging.getLogger("llm_proxy")
 
 
 def setup_logging(config: ProxyConfig) -> None:
@@ -97,6 +101,28 @@ class TokenBucketRateLimiter:
 
 
 # ---------------------------------------------------------------------------
+# Header / path helpers
+# ---------------------------------------------------------------------------
+
+
+def _match_paths(path: str, allowed: list[str]) -> bool:
+    """True if path exactly matches or is nested under an allowed prefix."""
+    return any(path == a or path.startswith(a + "/") for a in allowed)
+
+
+def _strip_header(headers: dict, name: str) -> None:
+    """Remove every case variant of a header from a plain dict."""
+    for key in [k for k in headers if k.lower() == name.lower()]:
+        del headers[key]
+
+
+def _set_header(headers: dict, name: str, value: str) -> None:
+    """Set a header, first removing any existing case variant."""
+    _strip_header(headers, name)
+    headers[name] = value
+
+
+# ---------------------------------------------------------------------------
 # Request handler
 # ---------------------------------------------------------------------------
 
@@ -148,34 +174,39 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
                 status=403,
             )
 
-    # --- 1. Path allowlist (Anthropic API only — external hosts skip this) ---
+    # --- 1. Path allowlist + provider routing (external hosts skip this) ---
     request_path = request.path
+    provider = None
     if not is_external:
-        path_allowed = any(
-            request_path == allowed or request_path.startswith(allowed + "/")
-            for allowed in config.allowed_paths
-        )
-        if not path_allowed:
+        if _match_paths(request_path, config.allowed_paths):
+            provider = "anthropic"
+        elif _match_paths(request_path, config.openai_allowed_paths):
+            provider = "openai"
+
+        reason = None
+        if provider is None:
+            reason = "path_not_allowed"
+            message = f"Path '{request_path}' is not in the allowed list."
+        elif provider == "openai" and not config.openai_api_key:
+            reason = "openai_not_configured"
+            message = "OpenAI provider is not configured (OPENAI_API_KEY not set on proxy)."
+
+        if reason:
             elapsed_ms = (time.monotonic() - request_start) * 1000
             logger.warning(
-                "Blocked request to disallowed path",
+                "Blocked request",
                 extra={
                     "extra_data": {
                         "method": request.method,
                         "path": request_path,
                         "status": 403,
                         "latency_ms": round(elapsed_ms, 2),
-                        "reason": "path_not_allowed",
+                        "reason": reason,
                     }
                 },
             )
             return web.json_response(
-                {
-                    "error": {
-                        "type": "forbidden",
-                        "message": f"Path '{request_path}' is not in the allowed list.",
-                    }
-                },
+                {"error": {"type": "forbidden", "message": message}},
                 status=403,
             )
 
@@ -243,7 +274,9 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
     # --- 4. Build upstream request ---
     if is_external:
         upstream_url = f"https://{target_host}{request_path}"
-    else:
+    elif provider == "openai":
+        upstream_url = f"{config.openai_base_url}{request_path}"
+    else:  # anthropic
         upstream_url = f"{config.upstream_base_url}{request_path}"
     if request.query_string:
         upstream_url += f"?{request.query_string}"
@@ -260,12 +293,16 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
     if is_external:
         # External host: no API key injection; Host header is derived from URL by aiohttp
         pass
+    elif provider == "openai":
+        # OpenAI: inject a Bearer token; strip any client-sent (dummy) key material
+        _set_header(upstream_headers, "Authorization", f"Bearer {config.openai_api_key}")
+        _strip_header(upstream_headers, "x-api-key")
     else:
-        # Anthropic API: inject the real API key
-        upstream_headers["x-api-key"] = config.anthropic_api_key
-        upstream_headers["anthropic-version"] = upstream_headers.get(
-            "anthropic-version", "2023-06-01"
-        )
+        # Anthropic: inject the real API key; strip any client-sent Authorization
+        _set_header(upstream_headers, "x-api-key", config.anthropic_api_key)
+        _strip_header(upstream_headers, "authorization")
+        if not any(k.lower() == "anthropic-version" for k in upstream_headers):
+            upstream_headers["anthropic-version"] = "2023-06-01"
 
     # --- 5. Forward to upstream ---
     try:
@@ -324,6 +361,8 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
             }
             if is_external:
                 log_data["external_host"] = target_host
+            elif provider:
+                log_data["provider"] = provider
             logger.info(
                 "Proxied request",
                 extra={"extra_data": log_data},
@@ -374,7 +413,7 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
 
 async def handle_health(request: web.Request) -> web.Response:
     """Health check endpoint — always allowed regardless of path allowlist."""
-    return web.json_response({"status": "ok", "proxy": "anthropic-api-proxy"})
+    return web.json_response({"status": "ok", "proxy": "llm-api-proxy"})
 
 
 # ---------------------------------------------------------------------------
@@ -387,15 +426,20 @@ async def on_startup(app: web.Application) -> None:
     app["upstream_session"] = aiohttp.ClientSession(
         connector=aiohttp.TCPConnector(limit=20),
     )
+    cfg = app["config"]
     logger.info(
         "Proxy started",
         extra={
             "extra_data": {
-                "listen": f"{app['config'].listen_host}:{app['config'].listen_port}",
-                "upstream": app["config"].upstream_base_url,
-                "allowed_paths": app["config"].allowed_paths,
-                "rate_limit_rpm": app["config"].rate_limit_requests_per_minute,
-                "max_body_bytes": app["config"].max_request_body_bytes,
+                "listen": f"{cfg.listen_host}:{cfg.listen_port}",
+                "anthropic_enabled": bool(cfg.anthropic_api_key),
+                "anthropic_upstream": cfg.upstream_base_url,
+                "anthropic_allowed_paths": cfg.allowed_paths,
+                "openai_enabled": bool(cfg.openai_api_key),
+                "openai_upstream": cfg.openai_base_url,
+                "openai_allowed_paths": cfg.openai_allowed_paths,
+                "rate_limit_rpm": cfg.rate_limit_requests_per_minute,
+                "max_body_bytes": cfg.max_request_body_bytes,
             }
         },
     )

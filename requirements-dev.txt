@@ -1,6 +1,7 @@
 -r requirements-proxy.txt
 anthropic
 httpx2
+openai
 pytest
 pytest-aiohttp
 pytest-asyncio

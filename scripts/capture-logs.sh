@@ -16,7 +16,7 @@
 #     --pids-limit <100> \
 #     --tmp-size <100m> \
 #     --work-size <500m> \
-#     [--proxy-name <anthropic-proxy>] \
+#     [--proxy-name <llm-proxy>] \
 #     [--proxy-net <proxy-net>] \
 #     [--proxy-port <18080>]
 
@@ -28,14 +28,14 @@ set -euo pipefail
 MODE="direct"
 INTERACTIVE="false"
 LOG_BASE_DIR="logs"
-AGENT_IMAGE="claude-agent:latest"
+AGENT_IMAGE="sandbox-agent:latest"
 RUNTIME="runsc"
 MEMORY="2g"
 CPUS="2"
 PIDS_LIMIT="100"
 TMP_SIZE="100m"
 WORK_SIZE="500m"
-PROXY_NAME="anthropic-proxy"
+PROXY_NAME="llm-proxy"
 PROXY_NET="proxy-net"
 PROXY_PORT="18080"
 LOG_TIMESTAMPS="${LOG_TIMESTAMPS:-1}"
@@ -98,7 +98,7 @@ DOCKER_VERSION="$(docker version --format '{{.Server.Version}}' 2>/dev/null || e
 # Write initial metadata.json
 # ---------------------------------------------------------------------------
 STARTED_AT="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
-AGENT_CONTAINER_NAME="claude-agent-${SESSION_ID}"
+AGENT_CONTAINER_NAME="sandbox-agent-${SESSION_ID}"
 
 # Determine proxy running state
 PROXY_RUNNING_AT_START="false"
@@ -125,7 +125,7 @@ cat > "${SESSION_DIR}/metadata.json" <<EOF
   "cpus": "${CPUS}",
   "pids_limit": "${PIDS_LIMIT}",
   "image": "${AGENT_IMAGE}",
-  "proxy_image": "anthropic-proxy:latest",
+  "proxy_image": "llm-proxy:latest",
   "host": {
     "hostname": "${HOST_HOSTNAME}",
     "kernel": "${KERNEL_VERSION}",
@@ -215,7 +215,12 @@ DOCKER_FLAGS=(
   --user 1000:1000
   -e PYTHONUNBUFFERED=1
   -e ANTHROPIC_MODEL="${ANTHROPIC_MODEL:-}"
+  -e ALLOW_SHELL="${ALLOW_SHELL:-}"
+  -e ALLOW_SHELL_TOOL="${ALLOW_SHELL_TOOL:-}"
+  -e SHELL_TIMEOUT="${SHELL_TIMEOUT:-}"
 )
+# NOTE: the WORKSPACE_EXEC / CAP_ADD container knobs are wired into the plain
+# run/prompt targets, not these logged variants (which build their own flags).
 
 if [[ "$MODE" == "proxied" ]]; then
   DOCKER_FLAGS+=(
@@ -225,7 +230,14 @@ if [[ "$MODE" == "proxied" ]]; then
     -e ANTHROPIC_API_KEY="proxied"
   )
 else
-  DOCKER_FLAGS+=(-e ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-}")
+  # Direct mode — supports either provider (proxied mode is Anthropic-only)
+  DOCKER_FLAGS+=(
+    -e ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-}"
+    -e OPENAI_API_KEY="${OPENAI_API_KEY:-}"
+    -e OPENAI_MODEL="${OPENAI_MODEL:-}"
+    -e OPENAI_MAX_TOKENS="${OPENAI_MAX_TOKENS:-}"
+    -e LLM_PROVIDER="${LLM_PROVIDER:-}"
+  )
 fi
 
 # ---------------------------------------------------------------------------
@@ -327,7 +339,7 @@ cat > "${SESSION_DIR}/metadata.json" <<EOF
   "cpus": "${CPUS}",
   "pids_limit": "${PIDS_LIMIT}",
   "image": "${AGENT_IMAGE}",
-  "proxy_image": "anthropic-proxy:latest",
+  "proxy_image": "llm-proxy:latest",
   "host": {
     "hostname": "${HOST_HOSTNAME}",
     "kernel": "${KERNEL_VERSION}",

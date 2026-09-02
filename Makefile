@@ -1,11 +1,11 @@
 -include .env
 export
 
-IMAGE_NAME   := claude-agent
+IMAGE_NAME   := sandbox-agent
 IMAGE_TAG    := latest
 IMAGE        := $(IMAGE_NAME):$(IMAGE_TAG)
-PROXY_IMAGE  := anthropic-proxy:latest
-PROXY_NAME   := anthropic-proxy
+PROXY_IMAGE  := llm-proxy:latest
+PROXY_NAME   := llm-proxy
 PROXY_NET    := proxy-net
 RUNTIME      := runsc
 MEMORY       := 2g
@@ -14,7 +14,7 @@ PIDS_LIMIT   := 100
 TMP_SIZE     := 100m
 WORK_SIZE    := 500m
 PROXY_PORT   := 18080
-PROXY_LOG    := /tmp/anthropic-proxy.log
+PROXY_LOG    := /tmp/llm-proxy.log
 VENV         := .venv
 PYTHON       := $(VENV)/bin/python
 
@@ -23,9 +23,34 @@ LOG_CAPTURE        := scripts/capture-logs.sh
 LOG_MERGE          := scripts/merge-logs.sh
 LOG_RETENTION_DAYS := 30
 
+# Capability knobs — secure defaults; opt in per run (e.g. ALLOW_SHELL=1 make prompt)
+COMMA          := ,
+ALLOW_SHELL      ?=        # 1 enables the operator !exec REPL command
+ALLOW_SHELL_TOOL ?=        # 1 enables the model-callable run_shell tool
+SHELL_TIMEOUT    ?= 30     # timeout (seconds) shared by !exec and run_shell
+WORKSPACE_EXEC ?= 0        # 1 lets the agent run scripts it writes to /workspace
+CAP_ADD        ?=          # comma-separated Linux capabilities to add to the bounding set
+RUN_AS_ROOT    ?= 0        # 1 runs the agent as uid 0 (needed to make CAP_ADD *effective*;
+                           # still contained by gVisor's Sentry, not host root)
+
+# /workspace defaults to noexec — pass the explicit `exec` option to allow it
+# (dropping the word `noexec` is NOT enough; gVisor tmpfs defaults to noexec).
+ifeq ($(WORKSPACE_EXEC),1)
+WORKSPACE_TMPFS := /workspace:rw,nosuid,exec,size=$(WORK_SIZE)
+else
+WORKSPACE_TMPFS := /workspace:rw,noexec,nosuid,size=$(WORK_SIZE)
+endif
+CAP_ADD_FLAGS := $(foreach c,$(subst $(COMMA), ,$(CAP_ADD)),--cap-add $(c))
+ifeq ($(RUN_AS_ROOT),1)
+RUN_USER := 0:0
+else
+RUN_USER := 1000:1000
+endif
+
 .PHONY: build build-proxy run run-proxied prompt prompt-proxied \
+        run-openai prompt-openai run-openai-proxied prompt-openai-proxied \
         verify-gvisor clean help \
-        start-proxy stop-proxy proxy-status proxy-logs proxy-logs-follow venv \
+        start-proxy stop-proxy restart-proxy clean-agents proxy-status proxy-logs proxy-logs-follow venv \
         run-logged run-proxied-logged prompt-logged prompt-proxied-logged \
         logs-list logs-latest logs-review logs-events logs-merge \
         logs-clean logs-clean-all
@@ -47,45 +72,63 @@ build-proxy: ## Build the proxy image
 	docker build -t $(PROXY_IMAGE) -f Dockerfile.proxy .
 
 run: build ## Run agent in gVisor sandbox (API key from host env)
-	@test -n "$(ANTHROPIC_API_KEY)" || { echo "ERROR: ANTHROPIC_API_KEY is not set"; exit 1; }
-	@echo "Running agent (runtime=$(RUNTIME), model=$${ANTHROPIC_MODEL:-default}, API key hidden)"
+	@test -n "$(ANTHROPIC_API_KEY)$(OPENAI_API_KEY)" || { echo "ERROR: set ANTHROPIC_API_KEY and/or OPENAI_API_KEY"; exit 1; }
+	@echo "Running agent (runtime=$(RUNTIME), provider=$${LLM_PROVIDER:-auto}, API keys hidden)"
 	@docker run \
 		--runtime=$(RUNTIME) \
 		--rm \
 		--cap-drop ALL \
+		$(CAP_ADD_FLAGS) \
 		--security-opt no-new-privileges \
 		--read-only \
 		--tmpfs /tmp:rw,noexec,nosuid,size=$(TMP_SIZE) \
-		--tmpfs /workspace:rw,noexec,nosuid,size=$(WORK_SIZE) \
+		--tmpfs $(WORKSPACE_TMPFS) \
 		--memory $(MEMORY) \
 		--cpus $(CPUS) \
 		--pids-limit $(PIDS_LIMIT) \
-		--user 1000:1000 \
+		--user $(RUN_USER) \
+		-e ALLOW_SHELL="$(ALLOW_SHELL)" \
+		-e ALLOW_SHELL_TOOL="$(ALLOW_SHELL_TOOL)" \
+		-e SHELL_TIMEOUT="$(SHELL_TIMEOUT)" \
 		-e ANTHROPIC_API_KEY="$(ANTHROPIC_API_KEY)" \
 		-e ANTHROPIC_MODEL="$(ANTHROPIC_MODEL)" \
+		-e OPENAI_API_KEY="$(OPENAI_API_KEY)" \
+		-e OPENAI_MODEL="$(OPENAI_MODEL)" \
+		-e OPENAI_REASONING_EFFORT="$(OPENAI_REASONING_EFFORT)" \
+		-e OPENAI_MAX_TOKENS="$(OPENAI_MAX_TOKENS)" \
+		-e LLM_PROVIDER="$(LLM_PROVIDER)" \
 		$(IMAGE)
 
 prompt: build ## Interactive prompt — direct mode (API key from host env)
-	@test -n "$(ANTHROPIC_API_KEY)" || { echo "ERROR: ANTHROPIC_API_KEY is not set"; exit 1; }
-	@echo "Starting REPL (runtime=$(RUNTIME), model=$${ANTHROPIC_MODEL:-default}, API key hidden)"
+	@test -n "$(ANTHROPIC_API_KEY)$(OPENAI_API_KEY)" || { echo "ERROR: set ANTHROPIC_API_KEY and/or OPENAI_API_KEY"; exit 1; }
+	@echo "Starting REPL (runtime=$(RUNTIME), provider=$${LLM_PROVIDER:-auto}, API keys hidden)"
 	@docker run \
 		--runtime=$(RUNTIME) \
 		--rm -it \
 		--cap-drop ALL \
+		$(CAP_ADD_FLAGS) \
 		--security-opt no-new-privileges \
 		--read-only \
 		--tmpfs /tmp:rw,noexec,nosuid,size=$(TMP_SIZE) \
-		--tmpfs /workspace:rw,noexec,nosuid,size=$(WORK_SIZE) \
+		--tmpfs $(WORKSPACE_TMPFS) \
 		--memory $(MEMORY) \
 		--cpus $(CPUS) \
 		--pids-limit $(PIDS_LIMIT) \
-		--user 1000:1000 \
+		--user $(RUN_USER) \
+		-e ALLOW_SHELL="$(ALLOW_SHELL)" \
+		-e ALLOW_SHELL_TOOL="$(ALLOW_SHELL_TOOL)" \
+		-e SHELL_TIMEOUT="$(SHELL_TIMEOUT)" \
 		-e ANTHROPIC_API_KEY="$(ANTHROPIC_API_KEY)" \
 		-e ANTHROPIC_MODEL="$(ANTHROPIC_MODEL)" \
+		-e OPENAI_API_KEY="$(OPENAI_API_KEY)" \
+		-e OPENAI_MODEL="$(OPENAI_MODEL)" \
+		-e OPENAI_REASONING_EFFORT="$(OPENAI_REASONING_EFFORT)" \
+		-e OPENAI_MAX_TOKENS="$(OPENAI_MAX_TOKENS)" \
+		-e LLM_PROVIDER="$(LLM_PROVIDER)" \
 		$(IMAGE) --interactive
 
 start-proxy: build-proxy ## Start the proxy container (bridge + internal network)
-	@test -n "$(ANTHROPIC_API_KEY)" || { echo "ERROR: ANTHROPIC_API_KEY is not set"; exit 1; }
+	@test -n "$(ANTHROPIC_API_KEY)$(OPENAI_API_KEY)" || { echo "ERROR: set ANTHROPIC_API_KEY and/or OPENAI_API_KEY"; exit 1; }
 	@if docker inspect -f '{{.State.Running}}' $(PROXY_NAME) 2>/dev/null | grep -q true; then \
 		echo "Proxy already running"; \
 	else \
@@ -95,6 +138,7 @@ start-proxy: build-proxy ## Start the proxy container (bridge + internal network
 		docker run -d --name $(PROXY_NAME) \
 			--network bridge \
 			-e ANTHROPIC_API_KEY="$(ANTHROPIC_API_KEY)" \
+			-e OPENAI_API_KEY="$(OPENAI_API_KEY)" \
 			-e PROXY_HOST=0.0.0.0 \
 			-e PROXY_PORT=$(PROXY_PORT) \
 			$(if $(PROXY_ALLOWED_EXTERNAL_HOSTS),-e PROXY_ALLOWED_EXTERNAL_HOSTS="$(PROXY_ALLOWED_EXTERNAL_HOSTS)") \
@@ -112,6 +156,17 @@ start-proxy: build-proxy ## Start the proxy container (bridge + internal network
 
 stop-proxy: ## Stop the proxy container
 	@docker rm -f $(PROXY_NAME) 2>/dev/null && echo "Proxy stopped" || echo "Proxy not running"
+
+restart-proxy: stop-proxy start-proxy ## Restart the proxy (picks up rebuilt image + changed keys/config)
+	@echo "Proxy restarted with current image and keys."
+
+clean-agents: ## Remove any stray agent containers (e.g. after a closed terminal)
+	@ids=$$(docker ps -aq --filter ancestor=$(IMAGE)); \
+	if [ -n "$$ids" ]; then \
+		docker rm -f $$ids >/dev/null && echo "Removed stray agent container(s)."; \
+	else \
+		echo "No stray agent containers."; \
+	fi
 
 proxy-status: ## Check proxy status
 	@docker inspect $(PROXY_NAME) --format 'Proxy running ({{.State.Status}})' 2>/dev/null || echo "Proxy not running"
@@ -138,14 +193,18 @@ run-proxied: build start-proxy ## Run agent via proxy (gVisor sandbox, network-i
 		--rm \
 		--network=$(PROXY_NET) \
 		--cap-drop ALL \
+		$(CAP_ADD_FLAGS) \
 		--security-opt no-new-privileges \
 		--read-only \
 		--tmpfs /tmp:rw,noexec,nosuid,size=$(TMP_SIZE) \
-		--tmpfs /workspace:rw,noexec,nosuid,size=$(WORK_SIZE) \
+		--tmpfs $(WORKSPACE_TMPFS) \
 		--memory $(MEMORY) \
 		--cpus $(CPUS) \
 		--pids-limit $(PIDS_LIMIT) \
-		--user 1000:1000 \
+		--user $(RUN_USER) \
+		-e ALLOW_SHELL="$(ALLOW_SHELL)" \
+		-e ALLOW_SHELL_TOOL="$(ALLOW_SHELL_TOOL)" \
+		-e SHELL_TIMEOUT="$(SHELL_TIMEOUT)" \
 		--add-host=proxy-host:$$PROXY_IP \
 		-e ANTHROPIC_PROXY_URL="http://proxy-host:$(PROXY_PORT)" \
 		-e ANTHROPIC_API_KEY="proxied" \
@@ -160,18 +219,90 @@ prompt-proxied: build start-proxy ## Interactive prompt — network-isolated via
 		--rm -it \
 		--network=$(PROXY_NET) \
 		--cap-drop ALL \
+		$(CAP_ADD_FLAGS) \
 		--security-opt no-new-privileges \
 		--read-only \
 		--tmpfs /tmp:rw,noexec,nosuid,size=$(TMP_SIZE) \
-		--tmpfs /workspace:rw,noexec,nosuid,size=$(WORK_SIZE) \
+		--tmpfs $(WORKSPACE_TMPFS) \
 		--memory $(MEMORY) \
 		--cpus $(CPUS) \
 		--pids-limit $(PIDS_LIMIT) \
-		--user 1000:1000 \
+		--user $(RUN_USER) \
+		-e ALLOW_SHELL="$(ALLOW_SHELL)" \
+		-e ALLOW_SHELL_TOOL="$(ALLOW_SHELL_TOOL)" \
+		-e SHELL_TIMEOUT="$(SHELL_TIMEOUT)" \
 		--add-host=proxy-host:$$PROXY_IP \
 		-e ANTHROPIC_PROXY_URL="http://proxy-host:$(PROXY_PORT)" \
 		-e ANTHROPIC_API_KEY="proxied" \
 		-e ANTHROPIC_MODEL="$(ANTHROPIC_MODEL)" \
+		$(IMAGE) --interactive
+
+# ---------------------------------------------------------------------------
+# OpenAI provider — dedicated targets (no need to set LLM_PROVIDER by hand)
+# ---------------------------------------------------------------------------
+
+run-openai: ## Run agent in gVisor sandbox (OpenAI, direct mode)
+	@LLM_PROVIDER=openai $(MAKE) --no-print-directory run
+
+prompt-openai: ## Interactive prompt — OpenAI, direct mode
+	@LLM_PROVIDER=openai $(MAKE) --no-print-directory prompt
+
+run-openai-proxied: build start-proxy ## Run agent via proxy (OpenAI, network-isolated)
+	@test -n "$(OPENAI_API_KEY)" || { echo "ERROR: OPENAI_API_KEY is not set (needed by the proxy)"; exit 1; }
+	@PROXY_IP=$$(docker inspect -f '{{json .NetworkSettings.Networks}}' $(PROXY_NAME) | python3 -c "import sys,json; print(json.loads(sys.stdin.read())['$(PROXY_NET)']['IPAddress'])") && \
+	echo "Proxy IP on $(PROXY_NET): $$PROXY_IP (provider=openai, API key hidden)" && \
+	docker run \
+		--runtime=$(RUNTIME) \
+		--rm \
+		--network=$(PROXY_NET) \
+		--cap-drop ALL \
+		$(CAP_ADD_FLAGS) \
+		--security-opt no-new-privileges \
+		--read-only \
+		--tmpfs /tmp:rw,noexec,nosuid,size=$(TMP_SIZE) \
+		--tmpfs $(WORKSPACE_TMPFS) \
+		--memory $(MEMORY) \
+		--cpus $(CPUS) \
+		--pids-limit $(PIDS_LIMIT) \
+		--user $(RUN_USER) \
+		-e ALLOW_SHELL="$(ALLOW_SHELL)" \
+		-e ALLOW_SHELL_TOOL="$(ALLOW_SHELL_TOOL)" \
+		-e SHELL_TIMEOUT="$(SHELL_TIMEOUT)" \
+		--add-host=proxy-host:$$PROXY_IP \
+		-e LLM_PROVIDER="openai" \
+		-e OPENAI_PROXY_URL="http://proxy-host:$(PROXY_PORT)" \
+		-e OPENAI_API_KEY="proxied" \
+		-e OPENAI_MODEL="$(OPENAI_MODEL)" \
+		-e OPENAI_REASONING_EFFORT="$(OPENAI_REASONING_EFFORT)" \
+		$(IMAGE)
+
+prompt-openai-proxied: build start-proxy ## Interactive prompt — OpenAI, network-isolated via proxy
+	@test -n "$(OPENAI_API_KEY)" || { echo "ERROR: OPENAI_API_KEY is not set (needed by the proxy)"; exit 1; }
+	@PROXY_IP=$$(docker inspect -f '{{json .NetworkSettings.Networks}}' $(PROXY_NAME) | python3 -c "import sys,json; print(json.loads(sys.stdin.read())['$(PROXY_NET)']['IPAddress'])") && \
+	echo "Proxy IP on $(PROXY_NET): $$PROXY_IP (provider=openai, API key hidden)" && \
+	docker run \
+		--runtime=$(RUNTIME) \
+		--rm -it \
+		--network=$(PROXY_NET) \
+		--cap-drop ALL \
+		$(CAP_ADD_FLAGS) \
+		--security-opt no-new-privileges \
+		--read-only \
+		--tmpfs /tmp:rw,noexec,nosuid,size=$(TMP_SIZE) \
+		--tmpfs $(WORKSPACE_TMPFS) \
+		--memory $(MEMORY) \
+		--cpus $(CPUS) \
+		--pids-limit $(PIDS_LIMIT) \
+		--user $(RUN_USER) \
+		-e ALLOW_SHELL="$(ALLOW_SHELL)" \
+		-e ALLOW_SHELL_TOOL="$(ALLOW_SHELL_TOOL)" \
+		-e SHELL_TIMEOUT="$(SHELL_TIMEOUT)" \
+		--add-host=proxy-host:$$PROXY_IP \
+		-e LLM_PROVIDER="openai" \
+		-e OPENAI_PROXY_URL="http://proxy-host:$(PROXY_PORT)" \
+		-e OPENAI_API_KEY="proxied" \
+		-e OPENAI_MODEL="$(OPENAI_MODEL)" \
+		-e OPENAI_REASONING_EFFORT="$(OPENAI_REASONING_EFFORT)" \
 		$(IMAGE) --interactive
 
 verify-gvisor: build ## Verify gVisor runtime via dmesg output

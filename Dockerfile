@@ -3,9 +3,10 @@ FROM python:3.12-slim
 # Create non-root user
 RUN groupadd -r agent && useradd -r -g agent -d /home/agent -s /bin/bash agent
 
-# Install Claude SDK + its transport lib (agent.py imports httpx2 directly,
-# so declare it explicitly rather than relying on the SDK's dependency tree)
-RUN pip install --no-cache-dir anthropic httpx2
+# Install the Anthropic + OpenAI SDKs. httpx2 is declared explicitly because
+# agent.py imports it directly rather than relying on the Anthropic SDK's
+# dependency tree; openai enables the optional OpenAI provider.
+RUN pip install --no-cache-dir anthropic httpx2 openai
 
 # Create workspace
 RUN mkdir -p /workspace && chown agent:agent /workspace

@@ -1,6 +1,6 @@
-# gVisor Claude Sandbox PoC
+# gVisor Agent Sandbox PoC
 
-Proof of concept for sandboxing Claude AI agent execution using gVisor (runsc). Runs a Python agent inside a hardened Docker container with dropped capabilities, read-only root filesystem, resource limits, and network isolation via a TCP reverse proxy on a Docker internal network.
+Proof of concept for sandboxing AI agent execution using gVisor (runsc). Runs a Python agent inside a hardened Docker container with dropped capabilities, read-only root filesystem, resource limits, and network isolation via a TCP reverse proxy on a Docker internal network.
 
 This is a proof of concept, not hardened production software — read [Security Hardening](#security-hardening) before trusting it with anything sensitive.
 
@@ -100,14 +100,14 @@ make prompt-proxied        # network-isolated mode
 ├── Dockerfile.proxy                          # Proxy image — aiohttp reverse proxy
 ├── Makefile                                  # Build/run/proxy/logging lifecycle targets
 ├── README.md                                 # This file
-├── agent.py                                  # Claude SDK agent — probe mode and interactive REPL
+├── agent.py                                  # Agent (Anthropic/OpenAI) — probe mode and interactive REPL
 ├── changelog.md                              # Development changelog (FEAT-002, bug fixes)
 ├── docker-runtime.md                         # gVisor runtime apply/revert runbook (setup + rollback)
 ├── logs/                                     # Session logs (git-ignored, host-side only)
 │   └── .gitkeep                              # Keeps the directory tracked
 ├── proxy.py                                  # TCP reverse proxy — rate limiting, path allowlist, streaming
 ├── proxy_config.py                           # Proxy configuration with env var overrides and validation
-├── requirements-dev.txt                      # Dev/test dependencies (proxy deps + anthropic, httpx2, pytest)
+├── requirements-dev.txt                      # Dev/test dependencies (proxy deps + anthropic, httpx2, openai, pytest)
 ├── requirements-proxy.txt                    # Proxy Python dependencies
 ├── scripts/
 │   ├── capture-logs.sh                       # Session orchestrator — creates log dir, runs container, captures logs
@@ -126,12 +126,17 @@ make prompt-proxied        # network-isolated mode
 | `make help` | Show all available targets |
 | `make build` | Build the agent Docker image |
 | `make build-proxy` | Build the proxy Docker image |
-| `make run` | Build and run agent in gVisor sandbox (API key from env) |
-| `make run-proxied` | Build agent + start proxy, run agent network-isolated via proxy |
-| `make prompt` | Interactive REPL — direct mode (API key from env) |
-| `make prompt-proxied` | Interactive REPL — network-isolated via proxy |
+| `make run` | Build and run agent in gVisor sandbox (Anthropic, direct) |
+| `make run-proxied` | Anthropic — start proxy, run agent network-isolated via proxy |
+| `make prompt` | Interactive REPL — Anthropic, direct mode |
+| `make prompt-proxied` | Interactive REPL — Anthropic, network-isolated via proxy |
+| `make run-openai` | Run agent in gVisor sandbox (OpenAI, direct) |
+| `make run-openai-proxied` | OpenAI — start proxy, run agent network-isolated via proxy |
+| `make prompt-openai` | Interactive REPL — OpenAI, direct mode |
+| `make prompt-openai-proxied` | Interactive REPL — OpenAI, network-isolated via proxy |
 | `make start-proxy` | Start the proxy container (bridge + internal network) |
 | `make stop-proxy` | Stop the proxy container |
+| `make restart-proxy` | Restart the proxy so it picks up a rebuilt image or changed keys/config |
 | `make proxy-status` | Check if the proxy container is running |
 | `make proxy-logs` | Show proxy container logs (snapshot) |
 | `make proxy-logs-follow` | Stream proxy logs live — watch requests during a session (Ctrl-C to stop) |
@@ -166,9 +171,14 @@ make prompt-proxied        # network-isolated mode
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `ANTHROPIC_API_KEY` | Yes | — | Anthropic API key for Claude access |
-| `ANTHROPIC_MODEL` | No | `claude-sonnet-5` | Claude model the agent calls (probe + interactive, both modes) |
-| `ANTHROPIC_PROXY_URL` | No | — | Set automatically in proxied mode; routes requests through proxy |
+| `ANTHROPIC_API_KEY` | Yes* | — | Anthropic API key (required for the Anthropic provider and all proxied modes) |
+| `ANTHROPIC_MODEL` | No | `claude-sonnet-5` | Anthropic model the agent calls (probe + interactive, both modes) |
+| `OPENAI_API_KEY` | Yes* | — | OpenAI API key — enables the OpenAI provider (direct mode only) |
+| `OPENAI_MODEL` | No | `gpt-5.6-sol` | OpenAI model the agent calls |
+| `OPENAI_MAX_TOKENS` | No | _(model default)_ | Output cap for OpenAI (`max_completion_tokens`); omitted when unset |
+| `LLM_PROVIDER` | No | _(auto)_ | Force a provider: `anthropic` or `openai`; unset auto-detects |
+| `ANTHROPIC_PROXY_URL` | No | — | Set automatically in Anthropic proxied mode; routes requests through the proxy |
+| `OPENAI_PROXY_URL` | No | — | Set automatically in OpenAI proxied mode; routes requests through the proxy |
 | `PROXY_HOST` | No | `127.0.0.1` | Proxy listen address |
 | `PROXY_PORT` | No | `18080` | Proxy listen port |
 | `PROXY_RATE_LIMIT_RPM` | No | `60` | Max requests per minute |
@@ -179,12 +189,42 @@ make prompt-proxied        # network-isolated mode
 | `PROXY_ALLOWED_PATHS` | No | `/v1/messages,/v1/complete,/v1/messages/batches` | Comma-separated API path allowlist |
 | `PROXY_ALLOWED_EXTERNAL_HOSTS` | No | _(empty)_ | Comma-separated external hosts the agent can reach via proxy (e.g., `github.com,google.com`) |
 
+\* At least one of `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` is required.
+
+### Providers
+
+The agent talks to **Anthropic** (default) or **OpenAI**. Selection order:
+
+1. `LLM_PROVIDER=anthropic|openai` — explicit switch.
+2. Otherwise auto-detect from which key is set.
+3. If **both** keys are set and `LLM_PROVIDER` is unset, **Anthropic wins** — set `LLM_PROVIDER=openai` to switch.
+
+Dedicated per-provider targets set `LLM_PROVIDER` for you — no env vars to remember:
+
+```bash
+# Anthropic (default)                 # OpenAI
+make run                              make run-openai
+make prompt                           make prompt-openai
+make run-proxied                      make run-openai-proxied        # network-isolated
+make prompt-proxied                   make prompt-openai-proxied
+
+# Override a model per provider (defaults: claude-sonnet-5 / gpt-5.6-sol)
+OPENAI_MODEL=gpt-5.6-terra make run-openai
+```
+
+> **Heads-up:** `start-proxy` reuses an already-running proxy container. After rebuilding the proxy image or changing keys/config (e.g. switching from an Anthropic-only proxy to also serving OpenAI), run **`make restart-proxy`** — otherwise a stale proxy will 403 the new provider's paths with *"not in the allowed list."*
+
+Set keys in `.env` (auto-loaded by the Makefile). Both providers can run **network-isolated through the proxy** — the proxy routes by request path (Anthropic paths → `api.anthropic.com` with `x-api-key`; OpenAI paths → `api.openai.com` with `Authorization: Bearer`), so a single proxy container serves both. `make start-proxy` passes whichever keys are set; the sandboxed agent only ever sees a dummy key. Two things to know:
+
+- **The real key stays out of the sandbox in proxied mode** — for OpenAI too, exactly as for Anthropic. The proxy injects it; the agent container gets `OPENAI_API_KEY=proxied`.
+- **OpenAI output cap** — `gpt-5.6-sol` and its exact API surface postdate this code, so the OpenAI path uses Chat Completions with `max_completion_tokens` only when `OPENAI_MAX_TOKENS` is set (otherwise the model's own default applies). Verify against current OpenAI docs if a call fails.
+
 ### Makefile Variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `IMAGE_NAME` | `claude-agent` | Agent Docker image name |
-| `PROXY_IMAGE` | `anthropic-proxy:latest` | Proxy Docker image name |
+| `IMAGE_NAME` | `sandbox-agent` | Agent Docker image name |
+| `PROXY_IMAGE` | `llm-proxy:latest` | Proxy Docker image name |
 | `RUNTIME` | `runsc` | Container runtime (gVisor) |
 | `MEMORY` | `2g` | Container memory limit |
 | `CPUS` | `2` | CPU limit |
@@ -282,22 +322,23 @@ LOG_RETENTION_DAYS=7 make run-logged
 
 The agent container connects directly to `https://api.anthropic.com` with the real API key injected as an environment variable. Network access is unrestricted.
 
-### Proxied Mode (`make run-proxied`)
+### Proxied Mode (`make run-proxied` / `make run-openai-proxied`)
 
 ```
 ┌─────────────────────────┐       ┌────────────────────┐       ┌──────────────────┐
-│  Agent Container        │       │  Proxy Container   │       │  Anthropic API   │
-│  (gVisor sandbox)       │──TCP──│  (bridge + internal│──TCP──│  api.anthropic.  │
-│  --network=proxy-net    │       │   network)         │       │  com             │
-│  No internet access     │       │  Injects real key  │       │                  │
+│  Agent Container        │       │  Proxy Container   │──TCP──│  Anthropic API   │
+│  (gVisor sandbox)       │──TCP──│  (bridge + internal│       │  api.anthropic…  │
+│  --network=proxy-net    │       │   network)         │──TCP──│  OpenAI API      │
+│  No internet access     │       │  Routes by path,   │       │  api.openai.com  │
+│                         │       │  injects real key  │       │                  │
 └─────────────────────────┘       └────────────────────┘       └──────────────────┘
         proxy-net (internal)              bridge (external)
 ```
 
-1. `start-proxy` creates a Docker internal network (`proxy-net`) and launches the proxy container connected to both `bridge` (internet) and `proxy-net`
+1. `start-proxy` creates a Docker internal network (`proxy-net`) and launches the proxy container connected to both `bridge` (internet) and `proxy-net`. It receives whichever real keys are set (`ANTHROPIC_API_KEY` and/or `OPENAI_API_KEY`).
 2. The agent container joins only `proxy-net` — no direct internet access
 3. The agent sends requests to `http://proxy-host:<port>` with a dummy API key
-4. The proxy validates the path, enforces rate limits and body size, injects the real API key, and forwards to `https://api.anthropic.com`
+4. The proxy **routes by request path**: Anthropic paths (`/v1/messages`, …) go to `https://api.anthropic.com` with an injected `x-api-key`; OpenAI paths (`/v1/chat/completions`, `/v1/responses`) go to `https://api.openai.com` with an injected `Authorization: Bearer`. It validates the path, enforces rate limits and body size on both.
 5. Responses (including streaming) are relayed back to the agent
 
 ### External Host Routing
@@ -353,23 +394,79 @@ The `make run` target applies these restrictions:
 
 The `run-proxied` target adds **network isolation** — the agent container can only reach the proxy on the internal Docker network, with no direct internet access.
 
+## Capabilities & Permissions (for experimenting)
+
+The defaults above are locked down. This is a sandbox PoC, so the point is to *relax specific permissions and watch what happens* — but explicitly, one knob at a time, keeping everything else hardened. Permissions live at two layers:
+
+**1. Application layer — giving the agent a shell.** By default the agent has no way to run commands; its only local tool is `!fetch`. There are two independent ways to grant shell access — enable either or both:
+
+- **`ALLOW_SHELL=1` — operator-driven `!exec`.** You type `!exec <cmd>` in the REPL; the command runs and the output is fed back to the model. The model can *suggest* commands but does not run them. Deterministic, human-in-the-loop.
+- **`ALLOW_SHELL_TOOL=1` — model-callable `run_shell` tool.** The model is given a `run_shell` tool and decides to call it *autonomously* (native tool-calling for both providers); the agent runs each call and returns the result until the model produces a final answer. This is the "real autonomous agent" mode.
+
+```bash
+# Operator-driven
+ALLOW_SHELL=1 make prompt           # then: you> !exec id
+
+# Model-driven (the model runs commands itself)
+ALLOW_SHELL_TOOL=1 make prompt      # then just ask: you> what uid are you running as?
+
+# Both at once
+ALLOW_SHELL=1 ALLOW_SHELL_TOOL=1 make prompt
+```
+
+Both share the same executor: commands run in `/workspace` with a `SHELL_TIMEOUT`-second cap (default 30) and truncated output, and what they can *do* is bounded by the container knobs below. (Live-checked: with `ALLOW_SHELL_TOOL=1`, the model called `run_shell` → `id` → `uid=1000` → answered, unprompted.)
+
+**2. Container layer — what the shell is allowed to do.** Opt-in Makefile toggles, each defaulting to the secure value:
+
+| Knob | Default | Effect | Verified behavior |
+|------|---------|--------|-------------------|
+| `ALLOW_SHELL` | off | Enables the operator `!exec` REPL command | — |
+| `ALLOW_SHELL_TOOL` | off | Enables the model-callable `run_shell` tool (native tool-calling) | Model invokes it on its own; loop runs until it stops calling tools |
+| `SHELL_TIMEOUT` | `30` | Per-command timeout (seconds), shared by both | — |
+| `WORKSPACE_EXEC` | `0` | Lets the agent run scripts it writes to `/workspace` | Passes the explicit `exec` mount option — dropping `noexec` alone is **not** enough (gVisor tmpfs defaults to `noexec`) |
+| `CAP_ADD` | _(none)_ | Comma-separated Linux capabilities (e.g. `net_bind_service`) | Adds them to the **bounding** set. Not *effective* for the non-root agent on its own |
+| `RUN_AS_ROOT` | `0` | Runs the agent as uid 0 | Makes `CAP_ADD` capabilities **effective** (`CapEff`). Root here is still contained by gVisor's Sentry — it is not host root |
+
+Examples:
+
+```bash
+# Let the agent write and execute its own scripts in /workspace
+ALLOW_SHELL=1 WORKSPACE_EXEC=1 make prompt
+# then: !exec sh -c 'echo "echo hi" > s.sh && chmod +x s.sh && ./s.sh'
+
+# Grant a capability and make it usable (needs root to be effective)
+ALLOW_SHELL=1 CAP_ADD=net_bind_service RUN_AS_ROOT=1 make prompt
+# then: !exec python3 -c "import socket; s=socket.socket(); s.bind(('0.0.0.0',80)); print('bound :80')"
+
+# Knobs compose with any provider/proxied target and can go in .env instead
+ALLOW_SHELL=1 make run-openai-proxied
+```
+
+Two facts worth internalizing (both empirically checked against `runsc`):
+
+- **`noexec` is enforced.** A script written to `/workspace` gets `EACCES` on `execve` unless `WORKSPACE_EXEC=1` supplies the explicit `exec` option.
+- **A capability is only usable when it is *effective*.** `--cap-add` alone lands the cap in the bounding set (`CapBnd`) but a non-root process keeps `CapEff: 0`; running as root (`RUN_AS_ROOT=1`) promotes it into `CapEff`.
+
+These knobs apply to the plain `run`/`prompt` targets and their provider/proxied variants. The `*-logged` capture variants carry `ALLOW_SHELL`/`SHELL_TIMEOUT` but not `WORKSPACE_EXEC`/`CAP_ADD`/`RUN_AS_ROOT` (they build their own container flags). Each relaxation weakens isolation deliberately — reach for them to probe boundaries, not as defaults.
+
 ## Agent Modes
 
 ### Probe Mode (default)
 
 1. `agent.py` collects runtime environment info (hostname, platform, filesystem permissions, network state, proxy mode)
 2. If `ANTHROPIC_PROXY_URL` is set, the client routes through the proxy; otherwise connects directly
-3. Sends environment data to Claude via the Anthropic SDK
-4. Claude analyzes the sandbox restrictions and suggests boundary-testing experiments
+3. Sends environment data to the model via the active provider's SDK
+4. The model analyzes the sandbox restrictions and suggests boundary-testing experiments
 5. Output is printed to stdout
 
 ### Interactive Mode (`--interactive`)
 
 1. Same environment collection and client setup as probe mode
-2. Opens a multi-turn REPL with `you>` / `claude>` prompts
-3. Claude receives the sandbox environment as a system prompt and maintains conversation history
+2. Opens a multi-turn REPL with `you>` / `model>` prompts
+3. The model receives the sandbox environment as a system prompt and maintains conversation history
 4. In proxied mode, use `!fetch <url>` to make HTTP GET requests through the proxy to whitelisted external hosts
-5. Exit with `Ctrl+D`, `exit`, or `quit`
+5. With `ALLOW_SHELL=1`, use `!exec <cmd>` to run a shell command in the sandbox (see [Capabilities & Permissions](#capabilities--permissions-for-experimenting))
+6. Exit with `Ctrl+D`, `exit`, or `quit`
 
 ## Testing
 
