@@ -385,7 +385,7 @@ async def handle_health(request: web.Request) -> web.Response:
 async def on_startup(app: web.Application) -> None:
     """Create the shared upstream HTTP session."""
     app["upstream_session"] = aiohttp.ClientSession(
-        connector=aiohttp.TCPConnector(limit=20, enable_cleanup_closed=True),
+        connector=aiohttp.TCPConnector(limit=20),
     )
     logger.info(
         "Proxy started",

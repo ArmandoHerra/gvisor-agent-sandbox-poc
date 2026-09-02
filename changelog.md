@@ -1,5 +1,64 @@
 # Changelog
 
+## [First-time setup validation — dependency fixes] - 2026-09-01
+
+### Fixed
+- `make venv` could not run the test suite: it only installed `requirements-proxy.txt`
+  (aiohttp), so `pytest` was never available. Added `requirements-dev.txt`
+  (`-r requirements-proxy.txt` + anthropic, httpx2, pytest, pytest-aiohttp,
+  pytest-asyncio) and pointed the `venv` target at it.
+- `agent.py` crashed on import in a freshly built image: it imported `httpx`
+  relying on it being a transitive dependency of the Anthropic SDK, but
+  `anthropic` 1.3.0 switched its transport to `httpx2`, so `httpx` was no longer
+  installed. Migrated `agent.py` to `import httpx2` (same exception names —
+  `RemoteProtocolError`/`ReadError`) so the streaming error handlers match what
+  the SDK's transport actually raises, and the Dockerfile now installs `httpx2`
+  explicitly instead of depending on the SDK's dependency tree.
+- Undeclared test dependency: `tests/test_proxy.py` uses the `aiohttp_client`
+  fixture from `pytest-aiohttp`, which was never listed anywhere. Declared in
+  `requirements-dev.txt`.
+- **`make run` / `make prompt` echoed the real `ANTHROPIC_API_KEY` to the
+  terminal**: the `docker run` recipe lines were not `@`-prefixed, so make
+  printed the full command including `-e ANTHROPIC_API_KEY="sk-ant-..."` into
+  scrollback (and anything capturing it). Both targets now run silenced with a
+  sanitized status line instead; the proxied targets were already fully
+  `@`-prefixed compound commands and never leaked.
+- Refusal notice upgraded to print its evidence: the `model` field of the
+  response (which model actually served the request) plus structured
+  `stop_details` (category + explanation) — so a refusal is attributable and
+  explainable, not just detected.
+- `make proxy-logs` always printed nothing: the proxy's structured logs go to
+  stderr (`logging.StreamHandler(sys.stderr)`), and the target's `2>/dev/null`
+  — meant to suppress docker's missing-container error — discarded every log
+  line. Now checks container existence first and shows both streams; added
+  `make proxy-logs-follow` (`docker logs -f`) for watching a live session.
+- Removed `enable_cleanup_closed=True` from the proxy's upstream `TCPConnector`
+  (`proxy.py`): it worked around a CPython SSL-transport leak fixed in
+  3.12.7+/3.13.1+ (cpython PR #118960); on current Pythons aiohttp ignores the
+  flag and emitted a DeprecationWarning per app startup (13 across the test
+  suite). Suite is now warning-free.
+
+### Changed
+- Agent model upgraded off the retired `claude-opus-4-6` and made configurable:
+  `ANTHROPIC_MODEL` env var (default `claude-sonnet-5` — Opus/Fable decline the
+  sandbox-probe prompt via safety classifiers; Sonnet 5 answers it cleanly and
+  shares the same 128K output cap; empty falls back) threaded through both
+  `agent.py` call
+  sites, all four Makefile run targets, and `capture-logs.sh`; the active model
+  now also appears in the probe's environment report.
+- Added a `stop_reason == "refusal"` notice after both streams — Fable-family
+  models can decline via safety classifiers with HTTP 200, which previously
+  would have rendered as a silent empty response.
+- `max_tokens` raised to a shared `MAX_TOKENS = 128000` constant in both call
+  sites (probe was 512, REPL 32768) — the output cap common to every current
+  Fable/Opus/Sonnet model; both sites stream, which the SDK requires at this
+  size.
+
+### Notes
+- Found while walking the README top-to-bottom on a fresh machine as an external
+  user would (guide-effectiveness test). Full suite green after fixes:
+  29 passed on Python 3.14 / anthropic 1.3.0 / httpx2 2.12.0.
+
 ## [Task: FEAT-002 Container Sandbox Logging & Capture] - 2026-03-12
 
 ### Added

@@ -9,7 +9,29 @@ import urllib.error
 import urllib.request
 
 import anthropic
-import httpx
+import httpx2
+
+# Model the agent calls — override with ANTHROPIC_MODEL (set it in .env or the
+# environment); an empty value falls back to the default.
+MODEL = os.environ.get("ANTHROPIC_MODEL") or "claude-sonnet-5"
+
+# 128K is the output cap shared by every current Fable/Opus/Sonnet model (the
+# SDK requires streaming at this size, which both call sites use). Older dated
+# snapshot models cap lower and will reject this value.
+MAX_TOKENS = 128000
+
+
+def _print_refusal(final) -> None:
+    """Report a safety refusal with its evidence: which model actually served
+    the request (response.model) and the structured reason (stop_details)."""
+    parts = [f"served by {final.model}"]
+    details = getattr(final, "stop_details", None)
+    if details is not None:
+        if getattr(details, "category", None):
+            parts.append(f"category: {details.category}")
+        if getattr(details, "explanation", None):
+            parts.append(f"explanation: {details.explanation}")
+    print(f"\n[request declined by the model's safety system — {'; '.join(parts)}]")
 
 
 def _check_network_isolated() -> bool:
@@ -84,6 +106,7 @@ def gather_env_info():
         "writable_root": os.access("/", os.W_OK),
         "proxied_mode": bool(proxy_url),
         "network_isolated": _check_network_isolated(),
+        "model": MODEL,
     }
     if proxy_url:
         info["proxy_url"] = proxy_url
@@ -149,13 +172,16 @@ Keep your response concise — under 200 words."""
     print("=== Claude Response ===")
     try:
         with client.messages.stream(
-            model="claude-opus-4-6",
-            max_tokens=512,
+            model=MODEL,
+            max_tokens=MAX_TOKENS,
             messages=[{"role": "user", "content": prompt}],
         ) as stream:
             for text in stream.text_stream:
                 print(text, end="", flush=True)
-    except (httpx.RemoteProtocolError, httpx.ReadError) as exc:
+            final = stream.get_final_message()
+            if final.stop_reason == "refusal":
+                _print_refusal(final)
+    except (httpx2.RemoteProtocolError, httpx2.ReadError) as exc:
         print(f"\n\n[stream interrupted: {exc}]")
     print()
 
@@ -247,15 +273,18 @@ def run_interactive(client: anthropic.Anthropic, env_info: dict) -> None:
         reply_parts: list[str] = []
         try:
             with client.messages.stream(
-                model="claude-opus-4-6",
-                max_tokens=32768,  # max for claude-opus-4-6 (sonnet-4-6 max is 16384)
+                model=MODEL,
+                max_tokens=MAX_TOKENS,
                 system=system_prompt,
                 messages=messages,
             ) as stream:
                 for text in stream.text_stream:
                     print(text, end="", flush=True)
                     reply_parts.append(text)
-        except (httpx.RemoteProtocolError, httpx.ReadError) as exc:
+                final = stream.get_final_message()
+                if final.stop_reason == "refusal":
+                    _print_refusal(final)
+        except (httpx2.RemoteProtocolError, httpx2.ReadError) as exc:
             print(f"\n\n[stream interrupted: {exc}]")
         print("\n")
 

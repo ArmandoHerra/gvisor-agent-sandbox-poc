@@ -214,6 +214,7 @@ DOCKER_FLAGS=(
   --pids-limit "${PIDS_LIMIT}"
   --user 1000:1000
   -e PYTHONUNBUFFERED=1
+  -e ANTHROPIC_MODEL="${ANTHROPIC_MODEL:-}"
 )
 
 if [[ "$MODE" == "proxied" ]]; then

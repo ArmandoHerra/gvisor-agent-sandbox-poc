@@ -1,0 +1,6 @@
+-r requirements-proxy.txt
+anthropic
+httpx2
+pytest
+pytest-aiohttp
+pytest-asyncio

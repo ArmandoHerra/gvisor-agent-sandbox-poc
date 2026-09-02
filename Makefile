@@ -25,7 +25,7 @@ LOG_RETENTION_DAYS := 30
 
 .PHONY: build build-proxy run run-proxied prompt prompt-proxied \
         verify-gvisor clean help \
-        start-proxy stop-proxy proxy-status proxy-logs venv \
+        start-proxy stop-proxy proxy-status proxy-logs proxy-logs-follow venv \
         run-logged run-proxied-logged prompt-logged prompt-proxied-logged \
         logs-list logs-latest logs-review logs-events logs-merge \
         logs-clean logs-clean-all
@@ -34,10 +34,10 @@ help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
 		awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-16s\033[0m %s\n", $$1, $$2}'
 
-venv: $(VENV)/bin/activate ## Create virtualenv and install proxy dependencies
-$(VENV)/bin/activate: requirements-proxy.txt
+venv: $(VENV)/bin/activate ## Create virtualenv and install dev dependencies (proxy + tests)
+$(VENV)/bin/activate: requirements-dev.txt requirements-proxy.txt
 	python3 -m venv $(VENV)
-	$(PYTHON) -m pip install --quiet -r requirements-proxy.txt
+	$(PYTHON) -m pip install --quiet -r requirements-dev.txt
 	@touch $(VENV)/bin/activate
 
 build: ## Build the agent image
@@ -48,7 +48,8 @@ build-proxy: ## Build the proxy image
 
 run: build ## Run agent in gVisor sandbox (API key from host env)
 	@test -n "$(ANTHROPIC_API_KEY)" || { echo "ERROR: ANTHROPIC_API_KEY is not set"; exit 1; }
-	docker run \
+	@echo "Running agent (runtime=$(RUNTIME), model=$${ANTHROPIC_MODEL:-default}, API key hidden)"
+	@docker run \
 		--runtime=$(RUNTIME) \
 		--rm \
 		--cap-drop ALL \
@@ -61,11 +62,13 @@ run: build ## Run agent in gVisor sandbox (API key from host env)
 		--pids-limit $(PIDS_LIMIT) \
 		--user 1000:1000 \
 		-e ANTHROPIC_API_KEY="$(ANTHROPIC_API_KEY)" \
+		-e ANTHROPIC_MODEL="$(ANTHROPIC_MODEL)" \
 		$(IMAGE)
 
 prompt: build ## Interactive prompt — direct mode (API key from host env)
 	@test -n "$(ANTHROPIC_API_KEY)" || { echo "ERROR: ANTHROPIC_API_KEY is not set"; exit 1; }
-	docker run \
+	@echo "Starting REPL (runtime=$(RUNTIME), model=$${ANTHROPIC_MODEL:-default}, API key hidden)"
+	@docker run \
 		--runtime=$(RUNTIME) \
 		--rm -it \
 		--cap-drop ALL \
@@ -78,6 +81,7 @@ prompt: build ## Interactive prompt — direct mode (API key from host env)
 		--pids-limit $(PIDS_LIMIT) \
 		--user 1000:1000 \
 		-e ANTHROPIC_API_KEY="$(ANTHROPIC_API_KEY)" \
+		-e ANTHROPIC_MODEL="$(ANTHROPIC_MODEL)" \
 		$(IMAGE) --interactive
 
 start-proxy: build-proxy ## Start the proxy container (bridge + internal network)
@@ -112,8 +116,19 @@ stop-proxy: ## Stop the proxy container
 proxy-status: ## Check proxy status
 	@docker inspect $(PROXY_NAME) --format 'Proxy running ({{.State.Status}})' 2>/dev/null || echo "Proxy not running"
 
-proxy-logs: ## Show proxy logs
-	@docker logs $(PROXY_NAME) 2>/dev/null || echo "No proxy container found"
+proxy-logs: ## Show proxy logs (snapshot; logs are on stderr, both streams shown)
+	@if docker inspect $(PROXY_NAME) >/dev/null 2>&1; then \
+		docker logs $(PROXY_NAME) 2>&1; \
+	else \
+		echo "No proxy container found"; \
+	fi
+
+proxy-logs-follow: ## Stream proxy logs live (Ctrl-C to stop)
+	@if docker inspect $(PROXY_NAME) >/dev/null 2>&1; then \
+		docker logs -f $(PROXY_NAME) 2>&1; \
+	else \
+		echo "No proxy container found"; \
+	fi
 
 run-proxied: build start-proxy ## Run agent via proxy (gVisor sandbox, network-isolated)
 	@PROXY_IP=$$(docker inspect -f '{{json .NetworkSettings.Networks}}' $(PROXY_NAME) | python3 -c "import sys,json; print(json.loads(sys.stdin.read())['$(PROXY_NET)']['IPAddress'])") && \
@@ -134,6 +149,7 @@ run-proxied: build start-proxy ## Run agent via proxy (gVisor sandbox, network-i
 		--add-host=proxy-host:$$PROXY_IP \
 		-e ANTHROPIC_PROXY_URL="http://proxy-host:$(PROXY_PORT)" \
 		-e ANTHROPIC_API_KEY="proxied" \
+		-e ANTHROPIC_MODEL="$(ANTHROPIC_MODEL)" \
 		$(IMAGE)
 
 prompt-proxied: build start-proxy ## Interactive prompt — network-isolated via proxy
@@ -155,6 +171,7 @@ prompt-proxied: build start-proxy ## Interactive prompt — network-isolated via
 		--add-host=proxy-host:$$PROXY_IP \
 		-e ANTHROPIC_PROXY_URL="http://proxy-host:$(PROXY_PORT)" \
 		-e ANTHROPIC_API_KEY="proxied" \
+		-e ANTHROPIC_MODEL="$(ANTHROPIC_MODEL)" \
 		$(IMAGE) --interactive
 
 verify-gvisor: build ## Verify gVisor runtime via dmesg output

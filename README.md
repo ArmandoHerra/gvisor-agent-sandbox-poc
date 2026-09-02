@@ -2,7 +2,65 @@
 
 Proof of concept for sandboxing Claude AI agent execution using gVisor (runsc). Runs a Python agent inside a hardened Docker container with dropped capabilities, read-only root filesystem, resource limits, and network isolation via a TCP reverse proxy on a Docker internal network.
 
+This is a proof of concept, not hardened production software — read [Security Hardening](#security-hardening) before trusting it with anything sensitive.
+
+**Contents:** [Prerequisites](#prerequisites) · [Docker Runtime Setup](#docker-runtime-setup) · [Quick Start](#quick-start) · [Tech Stack](#tech-stack) · [Project Structure](#project-structure) · [Available Commands](#available-commands) · [Configuration](#configuration) · [Logging](#logging) · [Architecture](#architecture) · [Security Hardening](#security-hardening) · [Agent Modes](#agent-modes) · [Testing](#testing) · [Reverting](#reverting)
+
+## Prerequisites
+
+| Requirement | Why | Quick check |
+|---|---|---|
+| Linux host | gVisor's application kernel only runs on Linux (not macOS/Windows Docker Desktop VMs) | `uname -s` → `Linux` |
+| Docker Engine, installed and running | Builds and runs the agent/proxy containers | `docker info >/dev/null && echo "Docker OK"` |
+| GNU Make | Drives every workflow in this repo (`make run`, `make venv`, etc.) | `make --version` |
+| gVisor (`runsc`) registered as a Docker runtime | Every container in the Makefile is launched with `--runtime=runsc` | `docker info \| grep -A2 -i runtimes` |
+| Python 3.12+ | Only needed for `make venv` / running the pytest suite locally | `python3 --version` |
+
+If Docker, Make, or Python aren't installed, install them via your distro's package manager first. If the `runsc` check doesn't list it yet, that's expected on a fresh machine — the next section walks through registering it.
+
+## Docker Runtime Setup
+
+`make run` (and any target that launches a container) needs `runsc` registered as a Docker runtime first. The steps below are the fast path; see **[docker-runtime.md](docker-runtime.md)** for the full runbook — capturing your machine's baseline before you touch anything, per-distro install notes, verification, and a clean revert.
+
+**Principle: runsc is an *additional* runtime, never the default.** Every container in this repo's Makefile is launched with `--runtime=runsc` explicitly (`RUNTIME := runsc`). Registering runsc as an extra runtime is all that's needed — do **not** set `"default-runtime": "runsc"` in `/etc/docker/daemon.json`. That keeps every other container on your machine running under stock `runc`, completely unaffected, and makes reverting later a one-file change.
+
+```bash
+# 1. Install runsc (Debian/Ubuntu shown; see docker-runtime.md for other distros)
+sudo apt-get update
+sudo apt-get install -y apt-transport-https ca-certificates curl gnupg
+
+ARCH=$(dpkg --print-architecture)
+KEY=/usr/share/keyrings/gvisor-archive-keyring.gpg
+URL=https://storage.googleapis.com/gvisor/releases
+LIST=/etc/apt/sources.list.d/gvisor.list
+
+curl -fsSL https://gvisor.dev/archive.key | sudo gpg --dearmor --yes -o "$KEY"
+echo "deb [arch=$ARCH signed-by=$KEY] $URL release main" | sudo tee "$LIST"
+
+sudo apt-get update
+sudo apt-get install -y runsc
+
+# 2. Register runsc as an additional Docker runtime
+sudo runsc install
+
+# 3. Reload Docker's config — reload registers the runtime without restarting running containers
+sudo systemctl reload docker
+```
+
+Verify:
+
+```bash
+# expect "runsc" listed, "Default Runtime: runc"
+docker info | grep -A2 -i runtimes   
+# runs dmesg inside the sandbox; look for gVisor's kernel banner
+make verify-gvisor
+```
+
+Before you modify `/etc/docker/daemon.json`, it's worth capturing your current baseline so revert is mechanical rather than guesswork — see [Step 0 in docker-runtime.md](docker-runtime.md). The full runbook also covers troubleshooting a misconfigured runtime and uninstalling `runsc` entirely.
+
 ## Quick Start
+
+With Docker and gVisor set up (previous section), you're ready to run the sandbox:
 
 ```bash
 # 1. Set your API key
@@ -44,10 +102,12 @@ make prompt-proxied        # network-isolated mode
 ├── README.md                                 # This file
 ├── agent.py                                  # Claude SDK agent — probe mode and interactive REPL
 ├── changelog.md                              # Development changelog (FEAT-002, bug fixes)
+├── docker-runtime.md                         # gVisor runtime apply/revert runbook (setup + rollback)
 ├── logs/                                     # Session logs (git-ignored, host-side only)
 │   └── .gitkeep                              # Keeps the directory tracked
 ├── proxy.py                                  # TCP reverse proxy — rate limiting, path allowlist, streaming
 ├── proxy_config.py                           # Proxy configuration with env var overrides and validation
+├── requirements-dev.txt                      # Dev/test dependencies (proxy deps + anthropic, httpx2, pytest)
 ├── requirements-proxy.txt                    # Proxy Python dependencies
 ├── scripts/
 │   ├── capture-logs.sh                       # Session orchestrator — creates log dir, runs container, captures logs
@@ -73,8 +133,9 @@ make prompt-proxied        # network-isolated mode
 | `make start-proxy` | Start the proxy container (bridge + internal network) |
 | `make stop-proxy` | Stop the proxy container |
 | `make proxy-status` | Check if the proxy container is running |
-| `make proxy-logs` | Show proxy container logs |
-| `make venv` | Create virtualenv and install proxy dependencies locally |
+| `make proxy-logs` | Show proxy container logs (snapshot) |
+| `make proxy-logs-follow` | Stream proxy logs live — watch requests during a session (Ctrl-C to stop) |
+| `make venv` | Create virtualenv and install dev dependencies (proxy + tests) |
 | `make verify-gvisor` | Verify gVisor runtime via dmesg output |
 | `make clean` | Remove images, network, and clean up |
 
@@ -106,6 +167,7 @@ make prompt-proxied        # network-isolated mode
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
 | `ANTHROPIC_API_KEY` | Yes | — | Anthropic API key for Claude access |
+| `ANTHROPIC_MODEL` | No | `claude-sonnet-5` | Claude model the agent calls (probe + interactive, both modes) |
 | `ANTHROPIC_PROXY_URL` | No | — | Set automatically in proxied mode; routes requests through proxy |
 | `PROXY_HOST` | No | `127.0.0.1` | Proxy listen address |
 | `PROXY_PORT` | No | `18080` | Proxy listen port |
@@ -291,7 +353,7 @@ The `make run` target applies these restrictions:
 
 The `run-proxied` target adds **network isolation** — the agent container can only reach the proxy on the internal Docker network, with no direct internet access.
 
-## How It Works
+## Agent Modes
 
 ### Probe Mode (default)
 
@@ -310,6 +372,8 @@ The `run-proxied` target adds **network isolation** — the agent container can 
 5. Exit with `Ctrl+D`, `exit`, or `quit`
 
 ## Testing
+
+### Unit tests
 
 ```bash
 # Create virtualenv with dependencies
@@ -337,9 +401,36 @@ Tests cover:
 - `proxy_fetch()` and `!fetch` REPL command handling
 - Network isolation detection
 
-## Prerequisites
+### Validating the sandbox itself
 
-- Linux host (gVisor only runs on Linux)
-- [gVisor (runsc)](https://gvisor.dev/docs/user_guide/install/) installed and configured as a Docker runtime
-- Docker installed
-- Python 3.12+ (for local proxy development/testing)
+Unit tests exercise the proxy and agent transport logic in isolation — they don't prove gVisor is actually intercepting the container's syscalls. To validate the sandbox end-to-end:
+
+```bash
+# Confirm the container is really running under gVisor (checks dmesg for gVisor's kernel banner)
+make verify-gvisor
+
+# Run the agent for real — probe mode reports what the sandbox restricts
+make run
+```
+
+## Reverting
+
+Done experimenting? Here's how to cleanly remove the PoC from your machine.
+
+```bash
+# 1. Stop the proxy container, remove built images and the proxy-net network
+make clean
+```
+
+Then undo the Docker runtime registration. The exact commands depend on whether you had a `/etc/docker/daemon.json` before you started — full details, including the optional `runsc` uninstall, are in **[docker-runtime.md's Revert section](docker-runtime.md#revert-return-to-your-baseline)**. In short:
+
+```bash
+# No daemon.json existed before setup:
+sudo rm /etc/docker/daemon.json
+# A daemon.json existed and you backed it up before setup:
+# sudo mv /etc/docker/daemon.json.pre-gvisor.bak /etc/docker/daemon.json
+
+sudo systemctl restart docker
+```
+
+**Note:** unlike the `reload` used during setup, this `restart` stops all running containers unless you have live-restore enabled — time it accordingly.
